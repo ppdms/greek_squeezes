@@ -1,0 +1,25 @@
+# Virtual environments
+.venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# TeX build/cache files
+.texmf-config/
+.texmf-var/
+*.aux
+*.log
+*.out
+*.synctex.gz
+report/pg-*.png
+
+# Dataset, model checkpoints, and run caches.
+data/
+*.npy
+*.pkl
+
+# OS / editor cruft
+.DS_Store
+.vscode/

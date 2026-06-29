@@ -1,0 +1,329 @@
+% Text Recognition of Ancient Greek "Squeezes"
+% Active report for the SqueezeTrOCR + charpost deployment.
+% Compile with: lualatex report.tex  (run twice for references)
+\documentclass[11pt]{article}
+
+\usepackage{fontspec}
+\defaultfontfeatures{Ligatures=TeX}
+\setmainfont{Latin Modern Roman}
+\setmonofont{Latin Modern Mono}[Scale=MatchLowercase,RawFeature={-tlig}]
+\usepackage[a4paper,margin=1.0in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{setspace}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,fit,backgrounds,calc}
+\usepackage[protrusion=true,expansion=true,final]{microtype}
+\usepackage[hidelinks,colorlinks=true,linkcolor=black,citecolor=black,urlcolor=blue!55!black]{hyperref}
+
+\setstretch{1.12}
+\setlength{\parskip}{0.35em plus 0.1em}
+\captionsetup{font=small,labelfont=bf}
+\captionsetup[sub]{font=footnotesize}
+\setlist{itemsep=2.5pt,topsep=3pt,parsep=0pt,leftmargin=1.6em}
+\setlength{\tabcolsep}{5pt}
+\setlength{\emergencystretch}{2em}
+\renewcommand{\topfraction}{0.92}
+\renewcommand{\bottomfraction}{0.7}
+\renewcommand{\textfraction}{0.06}
+\renewcommand{\floatpagefraction}{0.8}
+
+\definecolor{accent}{HTML}{1F4E79}
+\definecolor{baseblue}{HTML}{D6E4F0}
+\definecolor{addgold}{HTML}{F2C14E}
+\definecolor{addgoldbg}{HTML}{FBEFD3}
+\newcommand{\cer}{\mbox{CER}}
+\newcommand{\squeeze}{\textit{squeeze}}
+\newcommand{\model}{\texttt{SqueezeTrOCR}}
+\newcommand{\charpost}{\texttt{charpost}}
+\newcommand{\maybeinclude}[2][]{%
+  \IfFileExists{#2}{\includegraphics[#1]{#2}}{%
+    \fbox{\parbox{0.86\linewidth}{Missing figure: \texttt{#2}}}}}
+
+\tikzset{
+  basebox/.style={draw=accent!70,fill=baseblue,rounded corners=2pt,align=center,
+    font=\footnotesize,inner sep=4pt,minimum height=8mm,line width=0.5pt},
+  addbox/.style={draw=addgold!85!black,fill=addgoldbg,rounded corners=2pt,align=center,
+    font=\footnotesize,inner sep=4pt,minimum height=8mm,line width=0.7pt},
+  flow/.style={-{Stealth[length=2mm]},line width=0.6pt,draw=black!70},
+}
+
+\usepackage{titlesec}
+\titlespacing*{\section}{0pt}{1.9ex plus .5ex}{0.9ex}
+\titlespacing*{\subsection}{0pt}{1.3ex plus .4ex}{0.6ex}
+\titleformat{\section}{\normalfont\large\bfseries\color{accent}}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\normalfont\normalsize\bfseries}{\thesubsection}{0.5em}{}
+
+\pagestyle{plain}
+
+\begin{document}
+
+\begin{center}
+  {\LARGE\bfseries Text Recognition of Ancient Greek ``Squeezes''}\\[6pt]
+  {\small Dataset family: TROGS / ICDAR 2026 Competition in Text Recognition on Greek Squeezes}\\[8pt]
+  {\small\textbf{Vasileios Papadimas} --- Athens University of Economics and Business}\\[5pt]
+\end{center}
+\vspace{0.6ex}
+\hrule
+\vspace{1.2ex}
+
+\section{Introduction}
+A \squeeze{} is a paper cast taken from an inscribed stone surface. It is not an ink image. It is a
+shallow relief surface, photographed under raking light, where a letter stroke can be clear in one
+illumination direction and nearly absent in the other. Surface wear, paper grain, broken relief, and
+the geometry of the light all decide what evidence is visible.
+
+The deployed recognizer treats this as a physical multi-view reading problem. The visual backbone is
+\model{}, a dual-light TrOCR line-recognizer operating on horizontal crops containing up to 4 characters (referred to as tile4 crops) that packs both raking-light scans into one RGB tensor.
+The production transcript is then selected by a \charpost{} correction layer: a per-character posterior
+lattice, train-only character language models, and a learned ridge row ranker. In short, the line model
+supplies strong visual evidence; the lattice layer turns that evidence into letter-by-letter candidate
+rows and chooses the row that is visually and linguistically most plausible.
+
+The active artifact tree is rooted at \texttt{data/}. It contains one all-train line recognizer,
+five fold-excluded line recognizers, fold-clean character-posterior classifiers, character language
+models, the OOF ridge ranker, and decode artifacts. The cache-guarded notebook
+\texttt{greek\_squeezes.ipynb} validates or rebuilds the same tree locally, while \texttt{modal.py}
+builds and applies it on Modal.
+
+The most recent external production evaluation was run on
+\texttt{papadimas/trogs-26-test-images}, split \texttt{test}. This separate dataset has 50 squeezes,
+100 images, 605 scored rows, and 7,919 scored characters. The frozen production pipeline scored
+\cer{} \textbf{0.0822} (651 character errors). The run summary is staged under
+\texttt{data/prod\_runs/trogs26-test/summary.json} in the project Hugging Face bucket.
+
+\section{Data and Evaluation Hygiene}
+The internal TROGS development data keeps both scans of a physical squeeze in the same split or fold.
+This matters because \texttt{Rotation1} and \texttt{Rotation2} are two photographs of the same
+inscription, not independent examples. The line recognizers are trained from official train
+material only; the five OOF recognizers each exclude their held-out fold. Clean OOF means the held-out
+fold is excluded from three places:
+
+\begin{enumerate}
+  \item the fold TrOCR checkpoint used to initialize visual evidence,
+  \item the fold character-posterior classifier,
+  \item the fold train-only character n-gram language models.
+\end{enumerate}
+
+Validation and internal test outputs are report-only once the recipe is frozen. External production
+sets, including \texttt{trogs26-test}, are not used for training, checkpoint selection, ranker fitting,
+or hyper-parameter choice.
+
+\section{Dual-Light Line Recognition}
+\subsection{Physical motivation}
+Raking light is useful precisely because it is directional. A groove or ridge casts a shadow when the
+light crosses it, but can flatten into the paper texture when the light runs along it. The two scans are
+therefore complementary: one view may reveal a vertical stroke while the other reveals the crossbar or
+the opposite ridge wall. Decoding the scans separately asks the recognizer to choose a photograph before
+it has read the text. Dual-light packing instead gives the encoder both photographs at once.
+
+\subsection{Input representation}
+The line recognizer is the \model{} recipe: tile4 crops (horizontal crops containing up to 4 characters), a
+\texttt{microsoft/trocr-large-printed} encoder-decoder, and dual-light RGB packing. The paired crops are
+phase-registered and packed into the three channels that TrOCR already expects:
+
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Channel} & \textbf{Content} \\
+\midrule
+R & \texttt{Rotation1} crop \\
+G & \texttt{Rotation2} crop, phase-registered to \texttt{Rotation1} \\
+B & pixelwise \texttt{min(R,G)}, a dark-stroke union image \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The third channel is the key visual trick. It is not a natural color image; it is a dark-stroke union.
+If either lighting direction makes a groove dark, \texttt{min(R,G)} keeps that evidence dark. Training
+also uses random R/G channel swap and mono dropout 0.15, so the model cannot rely on a fixed lighting
+order or a single view. At evaluation time those stochastic augmentations are disabled, while phase
+registration and \texttt{DUAL\_MODE=min} remain enabled.
+
+\begin{figure}[htbp]
+  \centering
+  \maybeinclude[width=\textwidth]{figs/duallight_steps.png}
+  \caption{Dual-light construction for readable real tile4 (4-character) chunks: raw scans, cleaned registered
+  channels, the \texttt{min(R,G)} dark-stroke union, and the false-color RGB tensor seen by TrOCR.}
+  \label{fig:duallight}
+\end{figure}
+
+\subsection{Training recipe}
+The all-train line checkpoint at \texttt{data/line\_recognizer/all\_train} uses:
+
+\begin{itemize}
+  \item base model \texttt{microsoft/trocr-large-printed};
+  \item processor base \texttt{microsoft/trocr-base-printed};
+  \item real crops only, no synthetic data;
+  \item tile4 crops of up to 4 characters (\texttt{lmc=4});
+  \item 6000 optimizer steps, batch 96, gradient accumulation 1;
+  \item learning rate \(2\times 10^{-5}\), gradient checkpointing, validation gate \(\cer{} < 0.20\);
+  \item dual-light phase registration with max shift 0.15.
+\end{itemize}
+
+The fold checkpoints under \texttt{data/line\_recognizer/oof\_fold0} through
+\texttt{oof\_fold4} use the same recipe, but each excludes the corresponding OOF fold.
+
+\subsection{Model-view diagnostics}
+The visualizations below follow the same real chunks through the representation. The patch grid shows
+how the packed crop is divided into ViT tokens after resizing; the cross-attention view shows which
+patch regions the decoder attends to while emitting the generated proxy characters. These plots are
+interpretability diagnostics, not proof of a causal mechanism, but they are useful sanity checks: the
+model is reading letter-shaped regions, not only background texture.
+
+\begin{figure}[htbp]
+  \centering
+  \begin{subfigure}[t]{0.55\textwidth}
+    \centering
+    \maybeinclude[width=\linewidth]{figs/patch_grid.png}
+    \caption{Packed tile4 (4-character) crops over the checkpoint-declared \(24\times24\) patch grid.}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[t]{0.39\textwidth}
+    \centering
+    \maybeinclude[width=\linewidth]{figs/cross_attention.png}
+    \caption{Decoder cross-attention for generated proxy tokens.}
+  \end{subfigure}
+  \caption{How the packed DualLight crop is presented to, and then read by, the TrOCR encoder-decoder.}
+  \label{fig:attention}
+\end{figure}
+
+\section{Lattice Decoder and Ranker}
+The deployed correction layer turns the line recognizers into a per-character posterior pipeline. It
+extracts tile1 crops (single-character crops) from the letter boxes, trains a classifier over the explicit
+\charpost{} alphabet, and caches logits for each row position. This converts a row into a lattice:
+every position has a probability distribution over possible proxy characters. The row decoder can then
+separate two failure modes that are hard to distinguish in a single line string: the correct row may be
+absent from the visual lattice, or it may be present but ranked below a visually similar alternative.
+
+For OOF fitting, each fold has its own:
+
+\begin{itemize}
+  \item fold-excluded \charpost{} classifier initialized from the fold-excluded line recognizer;
+  \item held-out fold logits;
+  \item train-only character language models of orders 6, 10, and 12.
+\end{itemize}
+
+Candidate rows are proposed by beam search over the visual lattice and over lattice+LM scores. The
+current candidate search uses proposal weights \(0,0.25,0.5,0.75,1.0\), beam 256, and char-top-k 8.
+The learned ranker is a ridge model over:
+
+\begin{center}
+\small
+\texttt{visual\_sum, mean\_char\_logprob, length, length\_delta, lm6\_sum, lm10\_sum, lm12\_sum}.
+\end{center}
+
+The \texttt{length\_delta} feature follows the active
+\texttt{lattice\_length\_delta\_v2} schema: candidate length minus lattice/source length, not candidate
+length minus ground-truth length. After OOF fitting, the all-train \charpost{} classifier and
+train-only LMs produce validation, internal test, and production decodes.
+
+\begin{figure}[htbp]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[node distance=5mm and 6mm]
+  \node[addbox] (scans) {Two raking-light scans\\+ letter boxes};
+  \node[addbox,right=of scans] (line) {tile4 (4-char)\\dual-light TrOCR\\{\scriptsize all-train + 5 OOF}};
+  \node[addbox,right=of line] (tile1) {tile1 (1-char)\\dual-light\\\charpost{} crops};
+  \node[basebox,right=of tile1] (posterior) {\charpost{} classifier\\per-position logits};
+  \node[basebox,right=of posterior] (lattice) {row lattice\\beam candidates};
+  \node[addbox,right=of lattice] (rank) {ridge row ranker\\+ char LMs};
+  \node[addbox,right=of rank] (out) {transcripts\\+ scored decode};
+  \draw[flow] (scans)--(line);
+  \draw[flow] (line)--(tile1);
+  \draw[flow] (tile1)--(posterior);
+  \draw[flow] (posterior)--(lattice);
+  \draw[flow] (lattice)--(rank);
+  \draw[flow] (rank)--(out);
+\end{tikzpicture}%
+}
+\caption{Active deployed pipeline. The dual-light TrOCR family supplies visual initialization and
+artifact consistency; the decoded transcript is selected by a character-posterior lattice and
+row-level ridge ranker.}
+\label{fig:pipeline}
+\end{figure}
+
+\section{Results}
+Table~\ref{tab:results} separates the internal line-model reference numbers from the deployed external
+production result. The internal numbers are useful sanity checks for the underlying \model{} line
+model. The external score is the frozen \charpost{} production run described above and is the
+number to use for deployment claims.
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Current recorded metrics. Lower \cer{} is better.}
+\label{tab:results}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Artifact / run} & \textbf{Split} & \textbf{Setting} & \textbf{\cer{} $\downarrow$} \\
+\midrule
+\model{} line reference & internal validation & train-only LM & 0.0358 \\
+\model{} line reference & internal test & train-only LM & 0.0320 \\
+\model{} line reference & internal test & train+validation LM & 0.0310 \\
+\charpost{} production & \texttt{trogs26-test} & frozen deployed pipeline & \textbf{0.0822} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The production summary also records 605 predictions/transcript rows, 50 output transcript files, and
+100 input images. Its decode and logits artifacts were:
+
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Artifact} & \textbf{Modal volume path} \\
+\midrule
+Decode JSON & \texttt{/root/work/data/character\_posterior/prod\_trogs26-test\_\_prod\_decode.json} \\
+Logits NPZ & \texttt{/root/work/data/character\_posterior/prod\_trogs26-test\_\_prod\_logits.npz} \\
+Transcripts & \texttt{/root/work/data/prod\_outputs/trogs26-test/transcripts} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Deployment and Reproducibility}
+The active local notebook is \texttt{greek\_squeezes.ipynb}. It is cache-guarded: if artifacts are
+already present under \texttt{data/}, cells validate and skip them; if artifacts are missing and
+\texttt{RUN\_TRAINING\_IF\_MISSING=True}, the same runtime modules can rebuild them. On a normal laptop
+the preferred path is to sync the Modal/Hugging Face artifact tree first, because training the full
+\charpost{} stack locally is GPU-heavy.
+
+The Modal entry point is \texttt{modal.py}. The typical sequence is:
+
+\begin{enumerate}
+  \raggedright
+  \item \texttt{uvx modal run modal.py -{}-prepare}
+  \item \texttt{uvx modal run modal.py -{}-run -{}-upload}
+  \item \texttt{uvx modal run modal.py -{}-prod -{}-prod-source papadimas/trogs-26-test-images -{}-prod-source-split test -{}-prod-name trogs26-test}
+  \item \texttt{uvx modal run modal.py -{}-upload-prod-result-only -{}-prod-name trogs26-test}
+\end{enumerate}
+
+Reusable artifacts are uploaded from \texttt{/root/work/data} to the project Hugging Face bucket,
+\texttt{hf://buckets/papadimas/greek\_squeezes}. Production runs are staged under
+\texttt{data/prod\_runs/<slug>/}. Raw images and Hugging Face caches are deliberately excluded from
+the reusable artifact upload.
+
+\section{Conclusion}
+To read both raking-light views in a single forward pass, the system uses a registered RGB packing with a \texttt{min(R,G)} union channel. The deployed \charpost{} layer turns the line model into a clean OOF-trained character lattice and ridge row ranker. The resulting production pipeline is reproducible through \texttt{greek\_squeezes.ipynb}, cacheable under \texttt{data/}, runnable on Modal, and scored on a separate TROGS-26 test-image dataset at \cer{} \textbf{0.0822}.
+
+\section*{\normalsize References}
+{\footnotesize
+\begin{enumerate}[label={[\arabic*]}]
+  \item Howe, N.R., Chang, F., Falbo, I., Brown, T. \& Hershkowitz, A.
+        \textit{Character Recognition for Greek Squeezes.} IJDAR \textbf{28}, 345--356 (2025).
+  \item Li, M.\ et al.\ \textit{TrOCR: Transformer-based Optical Character Recognition with
+        Pre-trained Models.} AAAI 2022, arXiv:2109.10282.
+\end{enumerate}
+\par\smallskip
+\noindent The implementation uses PyTorch, Hugging Face \texttt{transformers}, OpenCV, scikit-learn,
+and the official TROGS CER convention.}
+
+\end{document}

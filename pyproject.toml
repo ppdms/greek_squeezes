@@ -1,0 +1,14 @@
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = [
+    ".venv",
+    "data",
+    "report",
+]
+
+[tool.ruff.format]
+quote-style = "preserve"
+indent-style = "space"
+line-ending = "auto"
+docstring-code-format = true
