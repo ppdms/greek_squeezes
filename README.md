@@ -27,7 +27,7 @@ The underlying frozen `SqueezeTrOCR` line-model reference in `data/results/line_
 
 - `greek_squeezes.ipynb` / `greek_squeezes.md`: cache-guarded notebook workflow.
 - `squeeze_runtime/`: runtime modules used by the notebook and Modal.
-- `modal.py`: Modal runner for artifact building, upload, status, and production eval.
+- `modal_app.py`: Modal runner for artifact building, upload, status, and production eval.
 - `report/`: final English report source and rendered PDF.
 - `data/`: ignored local artifact tree; sync or build this before running the notebook end-to-end.
 - `old/`: archived research notebooks, reports, scripts, and logs. Do not use for active claims.
@@ -101,19 +101,19 @@ uvx modal secret create huggingface-token HF_TOKEN=hf_...
 Prepare inputs:
 
 ```bash
-uvx modal run modal.py --prepare
+uvx modal run modal_app.py --prepare
 ```
 
 Build reusable charpost artifacts and upload them:
 
 ```bash
-uvx modal run modal.py --run --upload
+uvx modal run modal_app.py --run --upload
 ```
 
 Run the complete pipeline from line-recognizer training through final charpost decodes:
 
 ```bash
-uvx modal run --detach modal.py --full --bg --upload-reusable
+uvx modal run --detach modal_app.py --full --bg --upload-reusable
 ```
 
 `--full` trains or reuses `data/line_recognizer/all_train` and the five
@@ -123,19 +123,19 @@ only when you want the older behavior that requires those checkpoints to already
 Run only the initial `SqueezeTrOCR` line-recognizer stage:
 
 ```bash
-uvx modal run --detach modal.py --line-only --bg
+uvx modal run --detach modal_app.py --line-only --bg
 ```
 
 Check remote artifact status:
 
 ```bash
-uvx modal run modal.py --status
+uvx modal run modal_app.py --status
 ```
 
 Run the frozen pipeline on the external TROGS-26 test images:
 
 ```bash
-uvx modal run modal.py --prod \
+uvx modal run modal_app.py --prod \
   --prod-source papadimas/trogs-26-test-images \
   --prod-source-split test \
   --prod-name trogs26-test
@@ -144,7 +144,7 @@ uvx modal run modal.py --prod \
 Upload a completed production result:
 
 ```bash
-uvx modal run modal.py --upload-prod-result-only --prod-name trogs26-test
+uvx modal run modal_app.py --upload-prod-result-only --prod-name trogs26-test
 ```
 
 ## Report

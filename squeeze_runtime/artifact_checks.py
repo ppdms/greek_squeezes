@@ -282,7 +282,19 @@ class ArtifactChecks:
             expected_shards = len(inputs) if shards is None else shards
             if len(inputs) != expected_shards or row_shard_ids != list(range(expected_shards)):
                 return False
-            shard_paths = [Path(str(item.get('path') or '')) for item in inputs]
+            shard_paths = []
+            for item in inputs:
+                stored = Path(str(item.get('path') or ''))
+                if stored.is_file():
+                    shard_paths.append(stored)
+                else:
+                    # The merge command stores absolute paths from the build
+                    # environment.  If the volume is mounted at a different path
+                    # (e.g. /mnt/... in the notebook vs /root/work/... in the
+                    # pipeline), resolve the shard by filename next to the merged
+                    # file.
+                    resolved = path.parent / stored.name
+                    shard_paths.append(resolved if resolved.is_file() else stored)
             if not all(self.file_ready(shard_path) for shard_path in shard_paths):
                 return False
             if not all(
