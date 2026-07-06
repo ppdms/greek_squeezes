@@ -30,7 +30,6 @@ The underlying frozen `SqueezeTrOCR` line-model reference in `data/results/line_
 - `modal_app.py`: Modal runner for artifact building, upload, status, and production eval.
 - `report/`: final English report source and rendered PDF.
 - `data/`: ignored local artifact tree; sync or build this before running the notebook end-to-end.
-- `old/`: archived research notebooks, reports, scripts, and logs. Do not use for active claims.
 
 ## Model Stack
 
