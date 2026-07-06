@@ -5,18 +5,18 @@ jupyter:
       extension: .md
       format_name: markdown
       format_version: '1.3'
-      jupytext_version: 1.18.1
+      jupytext_version: 1.19.4
   kernelspec:
-    display_name: Python 3 (ipykernel)
+    display_name: .venv
     language: python
     name: python3
 ---
 
 # Greek Squeezes Charpost
 
-This notebook is the active cache-guarded recipe for the final Greek Squeezes OCR stack.
+This notebook is the recipe for the Greek Squeezes OCR stack.
 It expects artifacts under `data/` and validates each artifact before reusing it. If an
-artifact is missing and `RUN_TRAINING_IF_MISSING = True`, the notebook rebuilds it through
+artifact is missing and `RUN_TRAINING_IF_MISSING = True`, it rebuilds it through
 the same runtime modules used by the Modal runner.
 
 The deployed system has two stages:
@@ -50,14 +50,238 @@ Active artifacts:
 - `character_posterior/all_train__val_decode.json`
 - `character_posterior/all_train__test_decode.json`
 
-Clean OOF is required for claims: the held-out fold is excluded from the fold TrOCR checkpoint,
-the charpost classifier, and the fold character LMs. Validation/test/prod decodes are report-only
-after this recipe is frozen.
-
 ## 0. Setup
 
 This cell defines the artifact roots, fixed hyperparameters, and deterministic dual-light
 evaluation environment.
+
+
+## Artifact bootstrap
+
+Two supported environments, detected by one check:
+
+* **Modal** (`modal_notebook.py::jupyter` / `::run_all`): the prepared volume is
+  mounted at `/mnt/greek-squeezes-data` and the repo is baked at
+  `$MODAL_REPO_ROOT`. If the volume is empty, the HF bucket is synced *into the
+  volume*, so the download persists across sessions.
+* **Local**: run from the repo root; artifacts live in `./data`.
+
+Set `FORCE_REDOWNLOAD = True` to re-sync even if artifacts look present. On
+Modal, `HF_TOKEN` is injected by the `huggingface-token` secret; running
+locally, set the `HF_TOKEN` variable in the cell below (or export `HF_TOKEN`
+in your shell, or run `hf auth login` first) -- don't commit a notebook with a
+real token pasted into it.
+
+```python
+# --- Artifact bootstrap -------------------------------------------------
+# Modal: prepared volume at /mnt/greek-squeezes-data, repo at $MODAL_REPO_ROOT.
+# Local: repo root is the cwd, artifacts in ./data.
+FORCE_REDOWNLOAD = False
+HF_BUCKET_URI = 'hf://buckets/papadimas/greek_squeezes'
+# For local runs: set your token here instead of exporting HF_TOKEN (Modal
+# injects HF_TOKEN via the huggingface-token secret). Don't commit a real one.
+HF_TOKEN = ''
+
+import os, sys, tempfile, warnings
+from pathlib import Path
+warnings.filterwarnings('ignore', message='.*IProgress not found.*')
+
+_VOLUME = Path('/mnt/greek-squeezes-data')          # mounted by modal_notebook.py
+_data_root = _VOLUME if _VOLUME.exists() else Path.cwd()
+_data = _data_root / 'data'
+_data.mkdir(parents=True, exist_ok=True)
+
+_repo = Path(os.environ.get('MODAL_REPO_ROOT') or Path.cwd())
+if not (_repo / 'squeeze_runtime' / '__init__.py').is_file():
+    raise FileNotFoundError(f'squeeze_runtime/ not found under {_repo}; run from the repo root')
+os.environ['REPO_ROOT'] = str(_repo)
+os.environ['ARTIFACT_ROOT'] = str(_data_root)
+print('repo root     ->', _repo)
+print('artifact root ->', _data_root)
+
+
+def _artifacts_present(root: Path) -> bool:
+    sentinel_files = [
+        root / 'splits' / 'oof_folds.json',
+        root / 'line_recognizer' / 'all_train' / 'config.json',
+    ]
+    missing = [str(p.relative_to(root)) for p in sentinel_files if not p.is_file()]
+    if missing:
+        print('missing artifacts:', ', '.join(missing))
+    return not missing
+
+
+def _hf_sync_cli() -> str:
+    # `hf sync` on hf://buckets/... URIs needs huggingface_hub>=1.5, but
+    # transformers<5 (required for trocr's slow tokenizer) pins
+    # huggingface_hub<1.0, so the CLI in *this* environment never gains the
+    # `sync` subcommand. Use an isolated venv just for the CLI (same
+    # workaround as modal_app.py).
+    import subprocess
+    hfcli_dir = Path(tempfile.gettempdir()) / 'greek_squeezes_hfcli_venv'
+    hf_bin = hfcli_dir / 'bin' / 'hf'
+    if not hf_bin.exists():
+        print('installing isolated hf CLI (huggingface_hub>=1.5) ->', hfcli_dir)
+        subprocess.run([sys.executable, '-m', 'venv', str(hfcli_dir)], check=True)
+        subprocess.run([str(hfcli_dir / 'bin' / 'pip'), 'install', '-q',
+                        'huggingface_hub[hf_xet]>=1.5'], check=True)
+    return str(hf_bin)
+
+
+if FORCE_REDOWNLOAD or not _artifacts_present(_data):
+    import subprocess
+    _tok = HF_TOKEN or os.environ.get('HF_TOKEN', '')
+    if not _tok:
+        raise RuntimeError(
+            'No HF_TOKEN found. Set the HF_TOKEN variable above, export HF_TOKEN in '
+            'your shell, run `hf auth login`, or attach the `huggingface-token` Modal secret.'
+        )
+    os.environ['HF_TOKEN'] = _tok  # the hf CLI subprocess and later cells (raw dataset) read it
+    # Sync the bucket's data/ prefix straight into the local data/ dir -- NOT
+    # the bucket root onto the repo root, which would overwrite this repo's
+    # README.md with the bucket's.
+    print('downloading HF bucket ->', _data, '(this is large)')
+    subprocess.run([_hf_sync_cli(), 'sync', HF_BUCKET_URI.rstrip('/') + '/data', str(_data)], check=True)
+    if not _artifacts_present(_data):
+        raise RuntimeError('bucket sync completed but sentinel artifacts are still missing.')
+else:
+    print('caches already present at', _data_root, '- skipping download')
+```
+
+## Raw squeeze dataset
+
+The HF bucket stores trained artifacts, not the source squeeze scans. This cell
+fetches the public dataset `papadimas/trogs-greek-squeezes` (~7.4 GB) and lays
+it out as `data/Images/*_Rotation{1,2}_300dpi.png` and
+`data/Annotations/Annotations/*_letters.txt`, which the pipeline's dataset index
+requires. It skips work if the images are already present and falls back to the
+original Smith ScholarWorks zips if the HF mirror is unavailable.
+Set `DOWNLOAD_DATASET = False` to skip.
+
+```python
+# --- Raw squeeze dataset provisioning -------------------------------------
+import os, json, glob, tempfile, zipfile, shutil, importlib.util
+from pathlib import Path
+
+DOWNLOAD_DATASET = True
+HF_DATASET = 'papadimas/trogs-greek-squeezes'
+
+SCHOLARWORKS_FILES = {
+    'Annotations.zip': 'https://scholarworks.smith.edu/context/dds_data/article/1017/type/native/viewcontent',
+    'Images1.zip': 'https://scholarworks.smith.edu/cgi/viewcontent.cgi?filename=4&article=1017&context=dds_data&type=additional',
+    'Images2.zip': 'https://scholarworks.smith.edu/cgi/viewcontent.cgi?filename=1&article=1017&context=dds_data&type=additional',
+    'Images3.zip': 'https://scholarworks.smith.edu/cgi/viewcontent.cgi?filename=2&article=1017&context=dds_data&type=additional',
+    'Images4.zip': 'https://scholarworks.smith.edu/cgi/viewcontent.cgi?filename=3&article=1017&context=dds_data&type=additional',
+}
+
+_DATA_ROOT = Path(os.environ['ARTIFACT_ROOT'])
+_DATA = _DATA_ROOT / 'data'
+
+
+def _raw_data_ready(root: Path) -> bool:
+    images = glob.glob(str(root / 'Images' / '*.png'))
+    letters = glob.glob(str(root / 'Annotations' / 'Annotations' / '*_letters.txt'))
+    return len(images) >= 448 and bool(letters)
+
+
+def _link_or_copy(src: Path, dst: Path) -> str:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        return str(dst)
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+    return str(dst)
+
+
+def _prepare_raw_data(root: Path, token: str) -> None:
+    img_dir = root / 'Images'
+    ann_dir = root / 'Annotations'
+    img_dir.mkdir(parents=True, exist_ok=True)
+    ann_dir.mkdir(parents=True, exist_ok=True)
+    if _raw_data_ready(root):
+        print('raw data ready ->', root)
+        return
+    try:
+        from huggingface_hub import snapshot_download
+        dl_dir = Path(tempfile.gettempdir()) / 'hf_trogs_dataset'
+        if dl_dir.exists():
+            shutil.rmtree(dl_dir, ignore_errors=True)
+        print(f'downloading {HF_DATASET} (this is large) -> {dl_dir}')
+        root_dl = Path(snapshot_download(
+            repo_id=HF_DATASET, repo_type='dataset',
+            allow_patterns=['data/**'],
+            local_dir=str(dl_dir),
+            token=token or None,
+        ))
+        ann_nested = ann_dir / 'Annotations'
+        split_files = {
+            'train': ann_dir / 'training_set.txt',
+            'validation': ann_dir / 'validation_set.txt',
+            'test': ann_dir / 'test_set.txt',
+        }
+        split_bases = {split: set() for split in split_files}
+        n_img = 0
+        for split in split_files:
+            meta = root_dl / 'data' / split / 'metadata.jsonl'
+            with meta.open(encoding='utf-8') as fh:
+                for line in fh:
+                    rec = json.loads(line)
+                    split_bases[split].add(rec['base_id'])
+                    _link_or_copy(root_dl / 'data' / split / rec['file_name'],
+                                  img_dir / rec['file_name'])
+                    ann_path = ann_nested / rec['annotation_file']
+                    if not ann_path.exists():
+                        ann_path.parent.mkdir(parents=True, exist_ok=True)
+                        ann_path.write_text(rec['raw_annotation'].rstrip() + '\n',
+                                            encoding='utf-8')
+                    n_img += 1
+                    if n_img % 50 == 0:
+                        print(f'  staged {n_img} images ...')
+        for split, path in split_files.items():
+            path.write_text('\n'.join(sorted(split_bases[split])) + '\n', encoding='utf-8')
+        readme = ann_dir / 'README.txt'
+        if not readme.exists():
+            readme.write_text(
+                'Prepared from Hugging Face dataset papadimas/trogs-greek-squeezes.\n'
+                'Original source: https://scholarworks.smith.edu/dds_data/18\n',
+                encoding='utf-8')
+        shutil.rmtree(dl_dir, ignore_errors=True)
+        if _raw_data_ready(root):
+            print(f'raw data ready from Hugging Face; images={len(glob.glob(str(img_dir / "*.png")))}')
+            return
+        print('Hugging Face dataset mirror was incomplete; using ScholarWorks')
+    except Exception as exc:
+        print(f'Hugging Face dataset preparation failed: {exc}; using ScholarWorks')
+
+    import requests
+    for name, url in SCHOLARWORKS_FILES.items():
+        dst = Path(tempfile.gettempdir()) / name
+        print(f'downloading {name}')
+        with requests.get(url, stream=True, timeout=300) as response:
+            response.raise_for_status()
+            with dst.open('wb') as fh:
+                for chunk in response.iter_content(1 << 20):
+                    fh.write(chunk)
+        target = ann_dir if name == 'Annotations.zip' else img_dir
+        with zipfile.ZipFile(dst) as archive:
+            archive.extractall(target)
+        dst.unlink()
+        print(f'extracted {name}')
+    if not _raw_data_ready(root):
+        raise RuntimeError('raw data preparation failed; check HF_DATASET / ScholarWorks access')
+
+
+if DOWNLOAD_DATASET:
+    if importlib.util.find_spec('huggingface_hub') is None:
+        import subprocess
+        subprocess.run(['pip', 'install', '-q', 'huggingface_hub[hf_xet]'], check=True)
+    _tok = os.environ.get('HF_TOKEN', '')
+    _prepare_raw_data(_DATA, _tok)
+else:
+    print('DOWNLOAD_DATASET=False -> skipping raw squeeze dataset provisioning')
+```
 
 ```python
 from __future__ import annotations
@@ -68,11 +292,11 @@ import sys
 import types
 from pathlib import Path
 
-REPO = Path.cwd()
+REPO = Path(os.environ.get('REPO_ROOT', Path.cwd()))
 RUNTIME_DIR = REPO / 'squeeze_runtime'
 if str(RUNTIME_DIR) not in sys.path:
     sys.path.insert(0, str(RUNTIME_DIR))
-DATA = REPO / 'data'
+DATA = Path(os.environ.get('ARTIFACT_ROOT', str(REPO))) / 'data'
 WORK = DATA
 LINE_DIR = DATA / 'line_recognizer'
 CHARPOST_DIR = DATA / 'character_posterior'
@@ -122,20 +346,23 @@ for path in (DATA, LINE_DIR, CHARPOST_DIR, SPLITS_DIR, RANKER_DIR):
     path.mkdir(parents=True, exist_ok=True)
 
 print('repo       :', REPO)
+print('runtime    :', RUNTIME_DIR)
 print('data root :', DATA)
 ```
 
 ## 1. Runtime Modules
 
 Runtime code lives in `squeeze_runtime/` so the notebook only orchestrates and audits the
-pipeline. The import cell reloads the modules, points their mutable artifact roots at this
-repo's `data/` directory, and checks that the expected Python packages are installed.
+pipeline. The import cell reloads the modules, checks that the expected Python packages are
+installed, and points every module's artifact paths at this tree through
+`runtime_config.configure` -- the single place that wiring happens.
 
 ```python
-
 import importlib
 import importlib.util
+import subprocess
 
+# Runtime packages the notebook/pipeline need (import name -> pip package).
 _REQUIRED_IMPORTS = {
     'numpy': 'numpy',
     'pandas': 'pandas',
@@ -145,10 +372,23 @@ _REQUIRED_IMPORTS = {
     'transformers': 'transformers',
     'tokenizers': 'tokenizers',
     'sklearn': 'scikit-learn',
+    'matplotlib': 'matplotlib',
+    'textdistance': 'textdistance',
+    'accelerate': 'accelerate',
+    'einops': 'einops',
+    'timm': 'timm',
+    'sentencepiece': 'sentencepiece',
+    'requests': 'requests',
 }
-_missing = [pkg for mod, pkg in _REQUIRED_IMPORTS.items() if importlib.util.find_spec(mod) is None]
+_missing = [(mod, pkg) for mod, pkg in _REQUIRED_IMPORTS.items()
+            if importlib.util.find_spec(mod) is None]
 if _missing:
-    raise ImportError('Missing Python packages: ' + ', '.join(_missing))
+    _pkgs = [pkg for _, pkg in _missing]
+    print('installing missing runtime packages:', ', '.join(_pkgs))
+    subprocess.run(['pip', 'install', '-q', *_pkgs], check=True)
+    still = [mod for mod, _ in _missing if importlib.util.find_spec(mod) is None]
+    if still:
+        raise ImportError('Missing Python packages after install: ' + ', '.join(still))
 
 if not RUNTIME_DIR.exists():
     raise FileNotFoundError(f'missing runtime package: {RUNTIME_DIR}')
@@ -168,20 +408,16 @@ LF = _load_runtime_module('line_folds')
 R = _load_runtime_module('rerank')
 CL = _load_runtime_module('char_lattice')
 CR = _load_runtime_module('charpost_ranker')
+RF = _load_runtime_module('report_figs')
+RC = _load_runtime_module('runtime_config')
 
-# Point imported modules at the local artifact tree.
-R.WORK = str(WORK.resolve())
-
-CL.WORK = WORK
-CL.CHARPOST_DIR = CHARPOST_DIR
-CL.DEFAULT_FOLDS = FOLDS_JSON
-
-CR.WORK = WORK
-CR.CHARPOST_DIR = CHARPOST_DIR
-CR.OOF_DIR = RANKER_DIR
+# Point every runtime module at this artifact tree (the one sanctioned place).
+RC.configure(WORK, figs_dir=REPO / 'report' / 'figs')
 
 print('runtime imported from', RUNTIME_DIR)
-print('runtime modules:', ', '.join(['duallight', 'prep_cache', 'line_folds', 'rerank', 'char_lattice', 'charpost_ranker']))
+print('runtime modules:', ', '.join(['duallight', 'prep_cache', 'line_folds', 'rerank',
+                                     'char_lattice', 'charpost_ranker', 'report_figs',
+                                     'runtime_config']))
 ```
 
 ## 2. Pipeline Configuration
@@ -191,7 +427,6 @@ The active charpost recipe uses orders 6, 10, and 12 character LMs, a ridge scor
 `ArtifactChecks`: proposal weights `0,0.25,0.5,0.75,1.0`, beam 256, and char-top-k 8.
 
 ```python
-
 from artifact_checks import ArtifactChecks, PipelineConfig
 from charpost_pipeline import CharpostPipeline
 
@@ -240,7 +475,6 @@ real crops only, 6000 optimizer steps, batch 96, phase registration, channel swa
 training, and mono dropout 0.15.
 
 ```python
-
 # Verify the cached line recognizers.
 PIPELINE.ensure_line_models()
 ```
@@ -252,7 +486,6 @@ classifiers, fold logits, and fold-excluded character LMs. These are the only ar
 to fit the row ranker, so validation/test rows are not used for ranker selection.
 
 ```python
-
 PIPELINE.ensure_oof_artifacts()
 ```
 
@@ -263,7 +496,6 @@ features, and fits the final ridge scorer. The selected feature set is:
 `visual_sum, mean_char_logprob, length, length_delta, lm6_sum, lm10_sum, lm12_sum`.
 
 ```python
-
 PIPELINE.ensure_ranker()
 ```
 
@@ -271,22 +503,80 @@ PIPELINE.ensure_ranker()
 
 After OOF selection is frozen, the notebook trains or validates the final all-train charpost
 classifier, train-only character LMs, validation logits, test logits, and final decodes.
-The same frozen artifacts are used by `modal.py --prod` for external datasets such as
+The same frozen artifacts are used by `modal_app.py --prod` for external datasets such as
 `papadimas/trogs-26-test-images`.
 
 ```python
-
 PIPELINE.ensure_decodes()
 ```
 
 ## 7. Summary
 
-The summary prints artifact readiness, OOF ranker quality, and any available validation/test
-decode scores. The most recent external production run reported 50 squeezes, 100 images,
-605 scored rows, 7,919 characters, 651 errors, and CER 0.0822073494 on
-`papadimas/trogs-26-test-images`.
+The summary prints artifact readiness, OOF ranker quality, and any available validation/test decode scores. After freezing the methods, the `papadimas/trogs-26-test-images` run reported 50 squeezes, 100 images, 605 scored rows, 7,919 characters, 651 errors, and CER 0.0822073494.
+
+```python
+PIPELINE.summarize()
+```
+
+## 8. Mechanism Walkthrough and Report Figures
+
+This section makes the charpost mechanism inspectable on real cached artifacts and regenerates
+every figure used by `report/report.tex` into `report/figs/`. The figure builders live in
+`squeeze_runtime/report_figs.py`.
+
+`find_example_row` scans the frozen all-train test decode for a real row where the ranker
+overturns the visual-only argmax and lands on the ground truth (falling back to any
+disagreement, then the first row). The same returned row is then reused for the printed
+step-by-step narrative and for both lattice figures, so the report's prose and its figures
+describe one concrete, reproducible example instead of three independently sampled ones.
 
 ```python
 
-PIPELINE.summarize()
+# RF was imported and pointed at this tree by runtime_config.configure (Section 1).
+from IPython.display import Image as _Image, display as _display
+
+example = RF.maybe(RF.find_example_row)
+if example is not None:
+    RF.mechanism_walkthrough(rec=example)
+    graph_fig = RF.fig_lattice_graph(rec=example)
+    _display(_Image(str(graph_fig)))
+```
+
+The next cell rebuilds the remaining artifact-backed charpost figures. Each builder validates
+its inputs and is skipped (with a message) when the corresponding `data/` artifact has not been
+synced or built yet:
+
+- `charpost_lattice_example.png` — the same row as above, but as a full-alphabet lattice
+  heatmap with the truth / visual-only / ranker-selected paths and the top-scored candidates;
+- `charpost_cer_ladder.png` — OOF CER of the visual-only argmax vs the fitted ridge ranker
+  vs the lattice oracle, from the frozen candidate table;
+- `charpost_ranker_weights.png` — standardized ridge coefficients of the production ranker;
+- `charpost_confusion.png` — aggregate OOF tile1 classifier confusion over the 27-symbol
+  charpost alphabet.
+
+```python
+
+if example is not None:
+    _path = RF.maybe(RF.fig_lattice_example, rec=example)
+    if _path:
+        _display(_Image(str(_path)))
+
+for _fig in (RF.fig_cer_ladder, RF.fig_ranker_weights, RF.fig_confusion):
+    _path = RF.maybe(_fig)
+    if _path:
+        _display(_Image(str(_path)))
+```
+
+The last cell regenerates the line-model view figures from Section 3 of the report:
+the dual-light packing steps (`duallight_steps.png`), the ViT patch grid over packed crops
+(`patch_grid.png`), and decoder cross-attention for generated proxy tokens
+(`cross_attention.png`). These need the raw squeeze images and — for cross-attention — the
+all-train line checkpoint, so they are also cache-guarded.
+
+```python
+
+for _fig in (RF.fig_duallight_steps, RF.fig_patch_grid, RF.fig_cross_attention):
+    _path = RF.maybe(_fig)
+    if _path:
+        _display(_Image(str(_path)))
 ```

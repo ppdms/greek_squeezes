@@ -817,43 +817,32 @@ def _build_pipeline():
     CR = load_module('charpost_ranker')
     artifact_checks = load_module('artifact_checks')
     charpost_pipeline = load_module('charpost_pipeline')
+    runtime_config = load_module('runtime_config')
 
-    line_dir = DATA_DIR / 'line_recognizer'
-    charpost_dir = DATA_DIR / 'character_posterior'
-    splits_dir = DATA_DIR / 'splits'
-    ranker_dir = charpost_dir / 'oof_ranker'
-    image_cache_dir = charpost_dir / 'image_cache'
-    for path in (DATA_DIR, line_dir, charpost_dir, splits_dir, ranker_dir):
+    layout = runtime_config.configure(DATA_DIR)
+    for path in (DATA_DIR, layout['line_dir'], layout['charpost_dir'],
+                 layout['splits_dir'], layout['ranker_dir']):
         path.mkdir(parents=True, exist_ok=True)
 
-    folds_json = splits_dir / 'oof_folds.json'
     cfg = artifact_checks.PipelineConfig(
         repo=VOL_DIR,
-        charpost_dir=charpost_dir,
+        charpost_dir=layout['charpost_dir'],
         folds=FOLDS,
         tile=4,
-        folds_json=folds_json,
-        line_all_train=line_dir / 'all_train',
-        line_oof_fold={fold: line_dir / f'oof_fold{fold}' for fold in FOLDS},
+        folds_json=layout['folds_json'],
+        line_all_train=layout['line_dir'] / 'all_train',
+        line_oof_fold={fold: layout['line_dir'] / f'oof_fold{fold}' for fold in FOLDS},
         charpost_all_train_tag='all_train',
         charpost_oof_prefix='oof',
         charpost_orders=ORDERS,
-        image_cache_dir=image_cache_dir,
-        ranker_dir=ranker_dir,
-        candidates_json=ranker_dir / 'candidates.json',
-        ranker_json=ranker_dir / 'ranker_scores.json',
+        image_cache_dir=layout['image_cache_dir'],
+        ranker_dir=layout['ranker_dir'],
+        candidates_json=layout['ranker_dir'] / 'candidates.json',
+        ranker_json=layout['ranker_dir'] / 'ranker_scores.json',
         ranker_methods='ridge',
         charpost_ranker_features='visual_sum,mean_char_logprob,length,length_delta,lm6_sum,lm10_sum,lm12_sum',
         rank_fold_seed=LF.RANK_FOLD_SEED,
     )
-
-    R.WORK = str(DATA_DIR.resolve())
-    CL.WORK = DATA_DIR
-    CL.CHARPOST_DIR = charpost_dir
-    CL.DEFAULT_FOLDS = folds_json
-    CR.WORK = DATA_DIR
-    CR.CHARPOST_DIR = charpost_dir
-    CR.OOF_DIR = ranker_dir
 
     artifacts = artifact_checks.ArtifactChecks(cfg)
     pipeline = charpost_pipeline.CharpostPipeline(
@@ -1097,7 +1086,6 @@ def _line_job_unlocked(kind: str, *, fold: int = -1) -> str:
         print('line checkpoint ready ->', target, flush=True)
         return f'{job_id} ready'
 
-    import gc
     import numpy as np
     import torch
     from transformers import (
@@ -1116,16 +1104,9 @@ def _line_job_unlocked(kind: str, *, fold: int = -1) -> str:
         except Exception as exc:
             print(f'warning: torch sharing strategy not set: {exc!r}', flush=True)
 
-    # Build the notebook runtime context without loading a fine-tuned checkpoint.
-    g = pipeline.R.load(tile=LINE_TILE, load_model=False, verbose=True)
-    exec(pipeline.R._analysis_find('Baseline model: pretrained TrOCR'), g)
-    if 'baseline_model' in g:
-        del g['baseline_model']
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    train_defs = pipeline.R._analysis_find('MAX_LEN = 64').split('# ---- Resume-from-checkpoint cache')[0]
-    exec(train_defs, g)
+    # Line-recognizer context: dataset index, extractors, base processor,
+    # prep_image, and training helpers -- no model weights loaded.
+    g = pipeline.R.load(tile=LINE_TILE, load_model=False, verbose=True, train_context=True)
 
     index_df = g['index_df']
     train_df = index_df[index_df.split == 'train']

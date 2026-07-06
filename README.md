@@ -90,6 +90,11 @@ Open `greek_squeezes.ipynb` and run all cells. With synced artifacts, the notebo
 completed stages. Without artifacts, it can rebuild missing pieces only if `RUN_TRAINING_IF_MISSING`
 is true, but the full charpost stack is intended for a GPU/Modal run.
 
+Section 8 of the notebook walks through the charpost decode mechanism step by step on a real
+row from the cached decode and regenerates every figure used by `report/report.tex` into
+`report/figs/` (builders in `squeeze_runtime/report_figs.py`). Every builder there reads cached
+`data/` artifacts and is skipped individually when its inputs have not been synced or built yet.
+
 ## Modal
 
 Create the Hugging Face secret once:

@@ -1,15 +1,28 @@
 #!/usr/bin/env python3
-"""Notebook-backed loader for the shipped TrOCR line recognizer."""
+"""Loader for the shipped TrOCR line recognizer.
+
+``load()`` builds the context dict (``g``) that char_lattice,
+charpost_pipeline, report_figs, and modal_app consume: the dataset index,
+crop extractors, device, and optionally the fine-tuned checkpoint or the
+line-training helpers. All pieces are real functions in ``line_runtime`` /
+``contest_evaluation``; this module just composes them and handles
+checkpoint-specific configuration (run_config knobs, saved processors,
+charset-constrained decoding).
+"""
 import os, sys, json
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import contest_evaluation as CE
+import line_runtime as LR
+import prep_cache
 
 WORK = os.path.abspath(os.environ.get('SQUEEZE_WORK_DIR', 'data'))
 CKPT = os.path.join(WORK, 'line_recognizer', 'all_train')
 
 
 def _load_run_config(ckpt):
-    """Find a checkpoint run_config.json, if present."""
+    """Find a checkpoint run_config.json (checkpoint dir or up to two parents)."""
     candidates = [
         os.path.join(ckpt, 'run_config.json'),
         os.path.join(os.path.dirname(ckpt), 'run_config.json'),
@@ -17,10 +30,7 @@ def _load_run_config(ckpt):
     ]
     for path in candidates:
         if os.path.exists(path):
-            try:
-                return json.load(open(path))
-            except Exception:
-                return {}
+            return json.load(open(path))
     return {}
 
 
@@ -43,18 +53,6 @@ def _has_saved_processor(path):
              or os.path.exists(os.path.join(path, 'image_processor_config.json')))
             and (os.path.exists(os.path.join(path, 'tokenizer_config.json'))
                  or os.path.exists(os.path.join(path, 'tokenizer.json'))))
-
-
-def _analysis_find(marker):
-    from analysis_cells import ANALYSIS_CODE_CELLS
-
-    for source in ANALYSIS_CODE_CELLS:
-        if marker in source:
-            return (
-                source
-                .replace("os.path.abspath('data')", repr(os.path.abspath(WORK)))
-            )
-    raise RuntimeError(f'helper cell not found: {marker!r}')
 
 
 def _processor_path_for_ckpt(ckpt):
@@ -155,89 +153,84 @@ def make_charset_logits_processor(processor, allowed_chars, device, mode='charse
     return LogitsProcessorList([_AllowedTokensLogitsProcessor(ids, len(tok), device)])
 
 
-def load(ckpt=CKPT, tile=8, verbose=True, load_model=True):
-    """Exec the minimal notebook cells (no slow build_pairs) and load a FT checkpoint.
-    ckpt = path to a checkpoint dir; tile = LINE_MAX_CHARS the model was trained with (the crops
-    at inference must match training tiling). Works for trocr-base and trocr-large checkpoints.
-    load_model=False skips the FT checkpoint entirely (for cache-only analysis like viz_errors
-    compare, which reranks from cached candidates and never runs the model forward)."""
-    import shutil
+def load(ckpt=None, tile=8, verbose=True, load_model=True, train_context=False):
+    """Build the line-recognizer context dict.
+
+    ckpt = checkpoint dir (default: the module-level CKPT, resolved at call
+    time so runtime_config.configure() can retarget it); tile = the
+    LINE_MAX_CHARS the model was trained with
+    (recorded as g['TILE'] — crop extraction callers pass max_chars explicitly;
+    see the tiling note in line_runtime's module docstring).
+
+    load_model=False skips the fine-tuned checkpoint (cache-only consumers that
+    never run the model forward). train_context=True additionally provides the
+    base processor, prep_image, and the training helpers (_augment, _AUG_RNG,
+    MAX_LEN, compute_metrics) that the Modal line-training job needs — without
+    loading any model weights.
+
+    Returned keys (always): RUN_CONFIG, DEVICE, DTYPE, USE_FP16, empty_cache,
+    index_df, images_df, ANN_DIR, IMG_DIR, SPLIT_SOURCE, getRowTranscript,
+    to_gray, preprocess, preprocess_steps, extract_rows, extract_lines,
+    LINE_MAX_CHARS, TILE, ALPHABET, ft_model (None unless load_model).
+    With load_model or train_context: device, processor, prep_image, BASE_CKPT,
+    KEEP_ASPECT, PROC_SIZE. With load_model: ft_model, CKPT_PATH,
+    processor_path, LP_CHARSET. With train_context: MAX_LEN, _AUG_RNG,
+    _augment, compute_metrics.
+    """
+    ckpt = ckpt or CKPT
     run_config = _load_run_config(ckpt)
     _apply_dual_run_config(run_config)
-    g = {'__name__': '__main__', 'shutil': shutil}
-    g['RUN_CONFIG'] = run_config
-    g['DUAL_STREAM'] = False
-    os.environ.setdefault('USE_SYNTH', '0')
-    exec(_analysis_find('WORK_DIR  = os.path.abspath'), g)
-    exec(_analysis_find('Shared setup: dataset index'), g)
-    exec(_analysis_find('def to_gray').split('# Show the SAME samples')[0], g)  # defs only (skip slow demo)
-    exec(_analysis_find('def run_evaluations'), g)                              # scorer + box readers
-    g['LINE_MAX_CHARS'] = tile                                          # tile size for extract_rows/extract_lines
-    line_extract = _analysis_find('# === Line-image extraction').split('# === Build the line-image dataset')[0]
-    exec(line_extract, g)                                               # extract_rows/extract_lines only
-    try:                                # optional on-disk preprocess cache (PREP_CACHE=1)
-        import prep_cache as _pc        # scripts dir already on sys.path (top of file)
-        _pc.maybe_wrap(g, os.path.join(WORK, 'prep_cache'))
-    except Exception:
-        pass
-    if load_model:
-        exec(_analysis_find('Baseline model: pretrained TrOCR'), g)     # processor, prep_image, make_logits_processor, baseline_model
-        proc_path = _processor_path_for_ckpt(ckpt)
-        if proc_path:
-            g['processor'] = g['TrOCRProcessor'].from_pretrained(proc_path)
-            g['processor_path'] = proc_path
-        elif run_config.get('char_vocab'):
-            alpha = _alphabet_from_gt(g)
-            g['processor'].tokenizer = _build_char_tokenizer(alpha)
-            g['processor_path'] = '<reconstructed-char-vocab>'
-        _apply_input_run_config(g, run_config)
-        exec(_analysis_find('Character n-gram LM for shallow-fusion'), g)  # char_lm, trocr_decode
-    else:
-        char_lm_defs = _analysis_find('Character n-gram LM for shallow-fusion').split('# Train on TRAIN+VAL row transcripts')[0]
-        exec(char_lm_defs, g)                                             # CharNGramLM only
 
-    # FT checkpoint.
+    g = {'RUN_CONFIG': run_config}
+    g.update(LR.setup_environment())
+    g.update(LR.build_index(WORK))
+    g['getRowTranscript'] = CE.getRowTranscript
+    g['to_gray'] = LR.to_gray
+    g['preprocess'] = LR.preprocess
+    g['preprocess_steps'] = LR.preprocess_steps
+    extract_rows, extract_lines, lmc = LR.make_extractors(g['ANN_DIR'], g)
+    g['extract_rows'], g['extract_lines'], g['LINE_MAX_CHARS'] = extract_rows, extract_lines, lmc
+    # Optional on-disk preprocess cache (PREP_CACHE=1): replaces g['preprocess'],
+    # which extract_rows resolves through g at call time.
+    prep_cache.maybe_wrap(g, os.path.join(WORK, 'prep_cache'))
+    g['TILE'] = tile
+    g['ALPHABET'] = _alphabet_from_gt(g)
+
+    if load_model or train_context:
+        g.update(LR.build_trocr_context(g['DEVICE']))
+    if train_context:
+        g.update(LR.make_train_helpers(g['processor']))
     if not load_model:
         g['ft_model'] = None
-        g['TILE'] = tile
-        idf0 = g['index_df']
-        alpha0 = set()
-        for _, r in idf0[idf0['split'].isin(['train', 'val'])].iterrows():
-            for ch in g['getRowTranscript'](r['ann_path']).upper():
-                if not ch.isspace():
-                    alpha0.add(ch)
-        g['ALPHABET'] = sorted(alpha0)
         return g
-    import torch
+
+    # Fine-tuned checkpoint: prefer its saved processor; reconstruct a
+    # char-level tokenizer when the run trained with one but didn't save it.
+    proc_path = _processor_path_for_ckpt(ckpt)
+    if proc_path:
+        from transformers import TrOCRProcessor
+        g['processor'] = TrOCRProcessor.from_pretrained(proc_path)
+        g['processor_path'] = proc_path
+    elif run_config.get('char_vocab'):
+        g['processor'].tokenizer = _build_char_tokenizer(g['ALPHABET'])
+        g['processor_path'] = '<reconstructed-char-vocab>'
+    _apply_input_run_config(g, run_config)
+
     from transformers import VisionEncoderDecoderModel
-    model_cls = VisionEncoderDecoderModel
+    from trocr_model import fix_trocr_meta
 
     proc = g['processor']
-    model = model_cls.from_pretrained(ckpt, low_cpu_mem_usage=False).to(g['device'])
+    model = VisionEncoderDecoderModel.from_pretrained(ckpt, low_cpu_mem_usage=False).to(g['device'])
     model.config.decoder_start_token_id = proc.tokenizer.cls_token_id
     model.config.pad_token_id = proc.tokenizer.pad_token_id
     model.config.eos_token_id = proc.tokenizer.sep_token_id
     model.generation_config.decoder_start_token_id = proc.tokenizer.cls_token_id
     model.generation_config.pad_token_id = proc.tokenizer.pad_token_id
     model.generation_config.eos_token_id = proc.tokenizer.sep_token_id
-    try:                                  # the validated meta fix (needed for trocr-large pos-emb)
-        from trocr_model import fix_trocr_meta
-        model = fix_trocr_meta(model, g['device'])
-    except Exception as e:
-        if verbose:
-            print(f'(TrOCR meta-buffer fix unavailable: {e}; minimal fallback)', flush=True)
-        for name, buf in list(model.named_buffers()):
-            if getattr(buf, 'is_meta', False):
-                parent = model.get_submodule(name.rsplit('.', 1)[0]) if '.' in name else model
-                parent.register_buffer(name.rsplit('.', 1)[-1],
-                                       torch.zeros(buf.shape, dtype=buf.dtype, device=g['device']),
-                                       persistent=False)
+    model = fix_trocr_meta(model, g['device'])  # trocr-large pos-emb meta buffers
     g['ft_model'] = model.eval()
-    g['TILE'] = tile
     g['CKPT_PATH'] = ckpt
 
-    # Alphabet from GT (train+val) transcripts -> charset constraint (avoids build_pairs).
-    g['ALPHABET'] = _alphabet_from_gt(g)
     tok_vocab = len(proc.tokenizer)
     dec_vocab = int(getattr(model.config.decoder, 'vocab_size', model.config.vocab_size))
     if tok_vocab != dec_vocab:
