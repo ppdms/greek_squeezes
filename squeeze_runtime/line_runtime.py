@@ -366,7 +366,7 @@ def build_trocr_context(device: str) -> dict[str, Any]:
     from transformers import TrOCRProcessor
 
     base_ckpt = os.environ.get('TROCR_BASE', 'microsoft/trocr-base-printed')
-    processor = TrOCRProcessor.from_pretrained(base_ckpt)
+    processor = TrOCRProcessor.from_pretrained(base_ckpt, use_fast=False)
     keep_aspect = os.environ.get('KEEP_ASPECT', '0') == '1'
 
     def prep_image(pil, size=PROC_SIZE):

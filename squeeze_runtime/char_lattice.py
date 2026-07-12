@@ -304,6 +304,98 @@ def load_charpost_lm(path: str) -> Any:
     return CharPostNGramLM.load(str(path_obj))
 
 
+def profile_sums(lm: "CharPostNGramLM", text: str, max_order: int | None = None) -> dict[int, float]:
+    """lm_sum for every order 1..K from a single model, matching the
+    ``mean_logprob(text) * len(text)`` convention used by charpost_ranker.lm_sum.
+
+    The order-k value is the interpolation recursion truncated at m=k, so a single
+    order-K model yields the whole per-order profile in one pass -- exactly what a
+    stack of separate order-k models would produce (verified to ~1e-13)."""
+    K = int(lm.order if max_order is None else min(max_order, lm.order))
+    filt = keep_chars(text, lm.alphabet)
+    n = len(filt)
+    if n == 0:
+        return {k: 0.0 for k in range(1, K + 1)}
+    unigram = 1.0 / max(len(lm.vocab), 1)
+    log_floor = math.log(1e-12)
+    sums = [0.0] * (K + 1)
+    for i in range(n):
+        ch = filt[i]
+        if ch not in lm.vocab:
+            for k in range(1, K + 1):
+                sums[k] += log_floor
+            continue
+        context = filt[:i]
+        p = unigram
+        for m in range(1, K + 1):
+            ctx = context[-(m - 1):] if m > 1 else ""
+            cnt = lm.counts[m].get(ctx) if m < len(lm.counts) else None
+            total = lm.totals[m].get(ctx, 0) if m < len(lm.totals) else 0
+            ph = (cnt.get(ch, 0) / total) if (cnt and total) else 0.0
+            p = lm.lam * ph + (1.0 - lm.lam) * p
+            sums[m] += math.log(max(p, 1e-12))
+    scale = len(text) / n
+    return {k: sums[k] * scale for k in range(1, K + 1)}
+
+
+class CharPostPPMLM:
+    """Adaptive-order PPM-C scorer over a trained ``CharPostNGramLM``'s counts.
+
+    At each position it uses the longest context actually observed and, if the
+    symbol was not seen there, escapes to a shorter context with probability
+    D/(T+D) (D = distinct symbols in that context, T = total count) --- so the
+    effective order is chosen per character. It exposes the same
+    ``cond_logprob`` / ``mean_logprob`` interface as ``CharPostNGramLM``, so one
+    order-N count model can drive both the candidate beam (via ``lm_delta``) and
+    the ranker's language feature (via ``charpost_ranker.lm_sum``). No retraining
+    or separate artifact: it wraps a loaded n-gram model in place."""
+
+    def __init__(self, base: "CharPostNGramLM", max_order: int | None = None) -> None:
+        self.base = base
+        self.order = int(base.order if max_order is None else min(max_order, base.order))
+        self.alphabet = base.alphabet
+        self.vocab = base.vocab
+        self.counts = base.counts
+        self.totals = base.totals
+
+    def cond_logprob(self, ch: str, context: str) -> float:
+        if ch not in self.vocab:
+            return math.log(1e-12)
+        filt = keep_chars(context, self.alphabet)
+        esc = 1.0
+        p = None
+        for m in range(min(self.order, len(filt) + 1), 0, -1):
+            ctx = filt[-(m - 1):] if m > 1 else ""
+            cnt = self.counts[m].get(ctx) if m < len(self.counts) else None
+            if not cnt:
+                continue
+            total = self.totals[m].get(ctx, 0)
+            distinct = len(cnt)
+            denom = total + distinct
+            count = cnt.get(ch, 0)
+            if count > 0:
+                p = esc * (count / denom)
+                break
+            esc *= distinct / denom
+        if p is None:
+            p = esc * (1.0 / max(len(self.vocab), 1))
+        return math.log(max(p, 1e-12))
+
+    def mean_logprob(self, text: str) -> float:
+        filt = keep_chars(text, self.alphabet)
+        if not filt:
+            return 0.0
+        return sum(self.cond_logprob(filt[i], filt[:i]) for i in range(len(filt))) / len(filt)
+
+
+def ppm_c_sum(lm: "CharPostNGramLM", text: str, max_order: int | None = None) -> float:
+    """PPM-C cross-entropy sum, matching the ``mean_logprob(text) * len(text)``
+    convention of ``charpost_ranker.lm_sum``. Accepts a raw n-gram model or an
+    already-wrapped ``CharPostPPMLM``."""
+    ppm = lm if isinstance(lm, CharPostPPMLM) else CharPostPPMLM(lm, max_order)
+    return ppm.mean_logprob(text) * len(text)
+
+
 def edit_distance(a: str, b: str) -> int:
     prev = list(range(len(b) + 1))
     for i, ca in enumerate(a, 1):
@@ -1995,7 +2087,7 @@ def load_classifier_checkpoint(model_dir: Path, init_ckpt: str = "", tile: int =
     ckpt = load_classifier_head_file(model_dir, map_location=dev)
     processor_dir = model_dir / "processor"
     if processor_dir.exists():
-        processor = TrOCRProcessor.from_pretrained(processor_dir)
+        processor = TrOCRProcessor.from_pretrained(processor_dir, use_fast=False)
     else:
         proc_path = R._processor_path_for_ckpt(str(init))
         if not proc_path:
@@ -2003,7 +2095,7 @@ def load_classifier_checkpoint(model_dir: Path, init_ckpt: str = "", tile: int =
                 f"missing saved classifier processor at {processor_dir}; "
                 f"could not find processor files near init checkpoint {init}"
             )
-        processor = TrOCRProcessor.from_pretrained(proc_path)
+        processor = TrOCRProcessor.from_pretrained(proc_path, use_fast=False)
     prep = {
         "processor": processor,
         "prep_image": make_default_prep_image(int(ckpt.get("input_size", 0))),
@@ -2023,6 +2115,7 @@ def load_classifier_checkpoint(model_dir: Path, init_ckpt: str = "", tile: int =
 
 
 def command_cache_logits(args: argparse.Namespace) -> None:
+    import concurrent.futures
     import numpy as np
     import torch
 
@@ -2108,30 +2201,78 @@ def command_cache_logits(args: argparse.Namespace) -> None:
         row_idx: list[int] = []
         chunk_idx: list[int] = []
         row_texts: list[str] = []
+
+        def prepare_chunk(chunk: list[dict[str, Any]]) -> list[Any]:
+            # CPU-only (no CUDA calls): per-spec stacked tensors for one chunk
+            # of the batch. Safe to run on a background thread: everything
+            # here is CPU/PIL/tensor work with no shared mutable state other
+            # than the on-disk image cache, which is required to already be
+            # fully populated (--require-image-cache).
+            base_visuals = [
+                cached_visual_inputs_for_char_example(
+                    item,
+                    dataset_helpers,
+                    args.tile,
+                    input_mode,
+                    dual_mode,
+                    canonical_cache,
+                    image_cache_dir,
+                    args.require_image_cache,
+                    image_policy,
+                )
+                for item in chunk
+            ]
+            return [
+                torch.stack(
+                    [process_visual_inputs(processor, prep_image, apply_tta_visual(visual, spec), input_size)
+                     for visual in base_visuals],
+                    dim=0,
+                )
+                for spec in specs
+            ]
+
+        def prepare_batch(batch: list[dict[str, Any]], chunk_pool: concurrent.futures.ThreadPoolExecutor) -> Any:
+            # Split the batch across chunk_pool's workers (PIL decode and the
+            # numpy/tensor ops in process_visual_inputs release the GIL, so
+            # this actually parallelizes across cores) then concatenate every
+            # TTA variant along the batch dimension, so the forward pass below
+            # is a single batched GPU call instead of len(specs) separate ones
+            # -- mathematically identical (same images, same per-example
+            # averaging over specs), just reassembled from chunks.
+            n_workers = max(1, getattr(chunk_pool, "_max_workers", 1))
+            n_chunks = max(1, min(n_workers, len(batch)))
+            chunk_size = -(-len(batch) // n_chunks)
+            chunks = [batch[i:i + chunk_size] for i in range(0, len(batch), chunk_size)]
+            if len(chunks) <= 1:
+                chunk_results = [prepare_chunk(batch)]
+            else:
+                chunk_results = list(chunk_pool.map(prepare_chunk, chunks))
+            per_spec = [torch.cat([cr[s] for cr in chunk_results], dim=0) for s in range(len(specs))]
+            return torch.cat(per_spec, dim=0)
+
+        prep_workers = max(1, int(getattr(args, "prep_workers", 1)))
         with torch.no_grad():
-            for start in range(0, len(examples), args.batch):
-                batch = examples[start:start + args.batch]
-                logits_accum = None
-                base_visuals = [
-                    cached_visual_inputs_for_char_example(
-                        item,
-                        dataset_helpers,
-                        args.tile,
-                        input_mode,
-                        dual_mode,
-                        canonical_cache,
-                        image_cache_dir,
-                        args.require_image_cache,
-                        image_policy,
-                    )
-                    for item in batch
-                ]
-                for spec in specs:
-                    tensors = [
-                        process_visual_inputs(processor, prep_image, apply_tta_visual(visual, spec), input_size)
-                        for visual in base_visuals
-                    ]
-                    pix = torch.stack(tensors, dim=0).to(device)
+            starts = list(range(0, len(examples), args.batch))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as prefetch_pool, \
+                 concurrent.futures.ThreadPoolExecutor(max_workers=prep_workers) as chunk_pool:
+                # Depth-1 prefetch: while the GPU runs batch i's forward pass
+                # below, prefetch_pool's single thread is already preparing
+                # batch i+1's tensors (itself fanned out across chunk_pool),
+                # so GPU compute and CPU prep stop serializing against each
+                # other.
+                pending = (
+                    prefetch_pool.submit(prepare_batch, examples[starts[0]:starts[0] + args.batch], chunk_pool)
+                    if starts else None
+                )
+                for i, start in enumerate(starts):
+                    batch = examples[start:start + args.batch]
+                    pix_cpu = pending.result()
+                    if i + 1 < len(starts):
+                        next_start = starts[i + 1]
+                        pending = prefetch_pool.submit(
+                            prepare_batch, examples[next_start:next_start + args.batch], chunk_pool
+                        )
+                    pix = pix_cpu.to(device)
                     with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=args.fp16 and device.type == "cuda"):
                         logits = classifier_forward(
                             encoder,
@@ -2141,17 +2282,18 @@ def command_cache_logits(args: argparse.Namespace) -> None:
                             multiview_fuse=multiview_fuse,
                             interpolate_pos_encoding=interpolate_pos_encoding,
                         )
-                    logits_accum = logits.detach().float() if logits_accum is None else logits_accum + logits.detach().float()
-                logits_avg = logits_accum / max(len(specs), 1)
-                logits_parts.append(logits_avg.cpu().numpy())
-                labels.extend(label_to_id[item["label"]] for item in batch)
-                bases.extend(str(item["base"]) for item in batch)
-                row_idx.extend(int(item["row_idx"]) for item in batch)
-                chunk_idx.extend(int(item["chunk_idx"]) for item in batch)
-                row_texts.extend(str(item["row_text"]) for item in batch)
-                done = min(start + len(batch), len(examples))
-                if done == len(examples) or done % max(args.batch * 20, 1) == 0:
-                    print(f"  {split}: {done}/{len(examples)}", flush=True)
+                    logits = logits.detach().float()
+                    per_example = logits.shape[0] // max(len(specs), 1)
+                    logits_avg = logits.view(len(specs), per_example, logits.shape[-1]).mean(dim=0)
+                    logits_parts.append(logits_avg.cpu().numpy())
+                    labels.extend(label_to_id[item["label"]] for item in batch)
+                    bases.extend(str(item["base"]) for item in batch)
+                    row_idx.extend(int(item["row_idx"]) for item in batch)
+                    chunk_idx.extend(int(item["chunk_idx"]) for item in batch)
+                    row_texts.extend(str(item["row_text"]) for item in batch)
+                    done = min(start + len(batch), len(examples))
+                    if done == len(examples) or done % max(args.batch * 20, 1) == 0:
+                        print(f"  {split}: {done}/{len(examples)}", flush=True)
         arr = np.concatenate(logits_parts, axis=0) if logits_parts else np.zeros((0, len(alphabet)), dtype=np.float32)
         out_path = logits_path(args.tag, out_split)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2167,6 +2309,225 @@ def command_cache_logits(args: argparse.Namespace) -> None:
         )
         print(f"wrote {out_path} logits={arr.shape}")
         print(f"{split}: " + " ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}" for k, v in topk_metrics(arr, np.asarray(labels)).items()))
+
+
+def logits_shards_dir(tag: str, split: str) -> Path:
+    return CHARPOST_DIR / f"{tag}__{split}_logits_shards"
+
+
+def command_cache_logits_prep(args: argparse.Namespace) -> None:
+    """CPU-only stage: build and shard the (len(specs)*batch, C, H, W) pixel
+    tensors that command_cache_logits_forward later runs through the
+    classifier. This is the split-container counterpart to
+    command_cache_logits's intra-container threaded prefetch: instead of
+    overlapping CPU decode/TTA work with GPU compute inside one GPU-billed
+    container, it moves that work out entirely, so a GPU container is only
+    ever up for actual forward passes. Existing pipeline code (ensure_oof_logits,
+    production decode, etc.) still calls the single-container command_cache_logits;
+    this pair only backs generalization_gradient's Modal orchestration so far."""
+    import concurrent.futures
+    import torch
+
+    if not args.require_image_cache:
+        raise SystemExit("cache-logits-prep requires --require-image-cache")
+    model_dir = Path(args.model_dir)
+    prelim_ckpt = load_classifier_head_file(model_dir, map_location="cpu")
+    prelim_image_cache_dir = args.image_cache_dir or str(prelim_ckpt.get("image_cache_dir", ""))
+    cached_index, cached_index_path = load_cached_example_index(
+        prelim_image_cache_dir,
+        str(prelim_ckpt.get("input_mode", "dual_pack")),
+        str(prelim_ckpt.get("dual_mode", "min")),
+        dict(prelim_ckpt.get("image_policy") or {}),
+    )
+    print(f"cached example index loaded for logits prep: examples={len(cached_index)} path={cached_index_path}", flush=True)
+    # Loaded only for its saved processor/prep_image/alphabet metadata -- the
+    # encoder/head weights are never run here, and forcing device="cpu" means
+    # this stage needs no GPU regardless of the container it runs in.
+    _, _, ckpt, prep = load_classifier_checkpoint(model_dir, args.init_ckpt, args.tile, "cpu")
+    processor = prep["processor"]
+    prep_image = prep["prep_image"]
+    alphabet = str(ckpt["alphabet"])
+    input_mode = str(ckpt.get("input_mode", "dual_pack"))
+    dual_mode = str(ckpt.get("dual_mode", "min"))
+    input_size = int(ckpt.get("input_size", 0))
+    image_policy = dict(ckpt.get("image_policy") or {})
+    image_cache_dir = args.image_cache_dir or str(ckpt.get("image_cache_dir", ""))
+    specs = tta_specs(args.tta, args.tta_pixels, args.tta_scale)
+    canonical_cache: dict[str, tuple[Any, list[Any], list[list[int]], str]] = {}
+
+    def apply_tta_visual(visual: Any, spec: tuple[float, float, float]) -> Any:
+        if isinstance(visual, list):
+            return [apply_tta_image(img, spec) for img in visual]
+        return apply_tta_image(visual, spec)
+
+    def prepare_chunk(chunk: list[dict[str, Any]]) -> list[Any]:
+        base_visuals = [
+            cached_visual_inputs_for_char_example(
+                item, None, args.tile, input_mode, dual_mode, canonical_cache,
+                image_cache_dir, args.require_image_cache, image_policy,
+            )
+            for item in chunk
+        ]
+        return [
+            torch.stack(
+                [process_visual_inputs(processor, prep_image, apply_tta_visual(visual, spec), input_size)
+                 for visual in base_visuals],
+                dim=0,
+            )
+            for spec in specs
+        ]
+
+    include_bases = fold_bases_for_args(args, "include_fold_id")
+    exclude_bases = fold_bases_for_args(args, "exclude_fold_id")
+    split_names = [part.strip() for part in args.splits.split(",") if part.strip()]
+    if args.output_split and len(split_names) != 1:
+        raise SystemExit("--output-split requires exactly one source split in --splits")
+    prep_workers = max(1, int(getattr(args, "prep_workers", 1)))
+
+    for split in split_names:
+        examples = filter_cached_examples(
+            cached_index, split, alphabet, args.limit,
+            include_bases=include_bases, exclude_bases=exclude_bases,
+        )
+        out_split = args.output_split or split
+        shards_dir = logits_shards_dir(args.tag, out_split)
+        if shards_dir.exists():
+            shutil.rmtree(shards_dir)
+        shards_dir.mkdir(parents=True, exist_ok=True)
+        starts = list(range(0, len(examples), args.batch))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=prep_workers) as chunk_pool:
+            for i, start in enumerate(starts):
+                batch = examples[start:start + args.batch]
+                n_chunks = max(1, min(prep_workers, len(batch)))
+                chunk_size = -(-len(batch) // n_chunks)
+                chunks = [batch[j:j + chunk_size] for j in range(0, len(batch), chunk_size)]
+                chunk_results = [prepare_chunk(batch)] if len(chunks) <= 1 else list(chunk_pool.map(prepare_chunk, chunks))
+                per_spec = [torch.cat([cr[s] for cr in chunk_results], dim=0) for s in range(len(specs))]
+                pix = torch.cat(per_spec, dim=0)
+                shard = {
+                    "pix": pix,
+                    "labels": [item["label"] for item in batch],
+                    "bases": [str(item["base"]) for item in batch],
+                    "row_idx": [int(item["row_idx"]) for item in batch],
+                    "chunk_idx": [int(item["chunk_idx"]) for item in batch],
+                    "row_text": [str(item["row_text"]) for item in batch],
+                }
+                atomic_torch_save(shard, shards_dir / f"shard_{i:05d}.pt")
+                done = min(start + len(batch), len(examples))
+                if done == len(examples) or done % max(args.batch * 20, 1) == 0:
+                    print(f"  {split}: prepped {done}/{len(examples)}", flush=True)
+        manifest = {
+            "tag": args.tag,
+            "split": split,
+            "out_split": out_split,
+            "n_examples": len(examples),
+            "n_shards": len(starts),
+            "alphabet": alphabet,
+            "specs": [list(s) for s in specs],
+        }
+        atomic_write_json(shards_dir / "manifest.json", manifest, indent=2, sort_keys=True)
+        print(f"wrote {len(starts)} shards to {shards_dir}", flush=True)
+
+
+def command_cache_logits_forward(args: argparse.Namespace) -> None:
+    """GPU-only stage: consume shard files written by command_cache_logits_prep
+    and run the classifier forward pass with no CPU image-decode work in the
+    loop, so this container is only ever up for actual compute. Writes
+    byte-for-byte the same logits_path() output as command_cache_logits, then
+    deletes the consumed shard directory."""
+    import concurrent.futures
+    import numpy as np
+    import torch
+
+    model_dir = Path(args.model_dir)
+    encoder, head, ckpt, prep = load_classifier_checkpoint(model_dir, args.init_ckpt, args.tile, args.device)
+    device = prep["device"]
+    alphabet = str(ckpt["alphabet"])
+    label_to_id = {ch: i for i, ch in enumerate(alphabet)}
+    pooling = str(ckpt.get("pooling", "cls"))
+    multiview_fuse = str(ckpt.get("multiview_fuse", "concat"))
+    input_size = int(ckpt.get("input_size", 0))
+    interpolate_pos_encoding = bool(ckpt.get("interpolate_pos_encoding", input_size > 0))
+    specs = tta_specs(args.tta, args.tta_pixels, args.tta_scale)
+
+    split_names = [part.strip() for part in args.splits.split(",") if part.strip()]
+    if args.output_split and len(split_names) != 1:
+        raise SystemExit("--output-split requires exactly one source split in --splits")
+
+    for split in split_names:
+        out_split = args.output_split or split
+        shards_dir = logits_shards_dir(args.tag, out_split)
+        manifest_path = shards_dir / "manifest.json"
+        if not manifest_path.exists():
+            raise SystemExit(f"no shard manifest found; run cache-logits-prep first: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("alphabet") != alphabet:
+            raise SystemExit(
+                f"shard alphabet mismatch for {shards_dir}: shards={manifest.get('alphabet')!r} classifier={alphabet!r}"
+            )
+        want_specs = [list(s) for s in specs]
+        if manifest.get("specs") != want_specs:
+            raise SystemExit(
+                f"shard TTA-spec mismatch for {shards_dir}: shards={manifest.get('specs')} requested={want_specs}"
+            )
+        n_shards = int(manifest["n_shards"])
+        shard_paths = [shards_dir / f"shard_{i:05d}.pt" for i in range(n_shards)]
+
+        logits_parts: list[np.ndarray] = []
+        labels: list[int] = []
+        bases: list[str] = []
+        row_idx: list[int] = []
+        chunk_idx: list[int] = []
+        row_texts: list[str] = []
+
+        def load_shard(path: Path) -> Any:
+            return torch.load(path, map_location="cpu")
+
+        with torch.no_grad():
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                # Depth-1 prefetch of the next shard's disk read/deserialize
+                # while the GPU runs the current shard's forward pass.
+                pending = pool.submit(load_shard, shard_paths[0]) if shard_paths else None
+                for i, path in enumerate(shard_paths):
+                    shard = pending.result()
+                    if i + 1 < len(shard_paths):
+                        pending = pool.submit(load_shard, shard_paths[i + 1])
+                    pix = shard["pix"].to(device)
+                    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=args.fp16 and device.type == "cuda"):
+                        logits = classifier_forward(
+                            encoder, head, pix, pooling,
+                            multiview_fuse=multiview_fuse, interpolate_pos_encoding=interpolate_pos_encoding,
+                        )
+                    logits = logits.detach().float()
+                    per_example = logits.shape[0] // max(len(specs), 1)
+                    logits_avg = logits.view(len(specs), per_example, logits.shape[-1]).mean(dim=0)
+                    logits_parts.append(logits_avg.cpu().numpy())
+                    labels.extend(label_to_id[lbl] for lbl in shard["labels"])
+                    bases.extend(shard["bases"])
+                    row_idx.extend(shard["row_idx"])
+                    chunk_idx.extend(shard["chunk_idx"])
+                    row_texts.extend(shard["row_text"])
+                    done = i + 1
+                    if done == n_shards or done % 20 == 0:
+                        print(f"  {split}: forwarded shard {done}/{n_shards}", flush=True)
+
+        arr = np.concatenate(logits_parts, axis=0) if logits_parts else np.zeros((0, len(alphabet)), dtype=np.float32)
+        out_path = logits_path(args.tag, out_split)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_np_savez_compressed(
+            out_path,
+            logits=arr.astype(np.float16),
+            labels=np.asarray(labels, dtype=np.int64),
+            bases=np.asarray(bases),
+            row_idx=np.asarray(row_idx, dtype=np.int32),
+            chunk_idx=np.asarray(chunk_idx, dtype=np.int32),
+            row_text=np.asarray(row_texts),
+            alphabet=np.asarray(list(alphabet)),
+        )
+        print(f"wrote {out_path} logits={arr.shape}")
+        print(f"{split}: " + " ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}" for k, v in topk_metrics(arr, np.asarray(labels)).items()))
+        shutil.rmtree(shards_dir)
+        print(f"cleaned up shards {shards_dir}", flush=True)
 
 
 def load_decode_inputs(tag: str, split: str, device: str = "auto") -> dict[str, Any]:
@@ -2373,6 +2734,10 @@ def build_parser() -> argparse.ArgumentParser:
     clog.add_argument("--tile", type=int, default=1)
     clog.add_argument("--splits", default="val,test")
     clog.add_argument("--batch", type=int, default=64)
+    clog.add_argument("--prep-workers", type=int, default=4,
+                      help="threads for CPU-side image decode/TTA prep per batch, run "
+                           "alongside the depth-1 GPU prefetch; raise this toward the "
+                           "container's CPU count if GPU utilization is prep-bound")
     clog.add_argument("--device", default="auto")
     clog.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True)
     clog.add_argument("--limit", type=int, default=0)
@@ -2392,6 +2757,50 @@ def build_parser() -> argparse.ArgumentParser:
     clog.add_argument("--output-split", default="",
                       help="write logits under this split name, e.g. fold0, when slicing a source split")
     clog.set_defaults(func=command_cache_logits)
+
+    clogp = sub.add_parser("cache-logits-prep", help="CPU-only: build sharded pixel tensors for cache-logits-forward")
+    clogp.add_argument("--tag", default="charpost_t1L_ft")
+    clogp.add_argument("--model-dir", default=str(CHARPOST_DIR / "charpost_t1L_ft"))
+    clogp.add_argument("--init-ckpt", default="")
+    clogp.add_argument("--tile", type=int, default=1)
+    clogp.add_argument("--splits", default="val,test")
+    clogp.add_argument("--batch", type=int, default=64)
+    clogp.add_argument("--prep-workers", type=int, default=4,
+                       help="threads for CPU-side image decode/TTA prep per shard; raise "
+                            "toward the container's CPU count since this stage has no GPU to overlap with")
+    clogp.add_argument("--limit", type=int, default=0)
+    clogp.add_argument("--tta", choices=TTA_MODES, default="none",
+                       help="fixed test-time augmentation over crop translations/scales before averaging logits")
+    clogp.add_argument("--tta-pixels", type=int, default=4)
+    clogp.add_argument("--tta-scale", type=float, default=0.04)
+    clogp.add_argument("--image-cache-dir", default=str(CHARPOST_DIR / "image_cache"),
+                       help="disk cache for constructed tile1 RGB inputs; empty disables")
+    clogp.add_argument("--require-image-cache", action="store_true",
+                       help="required for this stage: fail instead of constructing missing RGB inputs")
+    clogp.add_argument("--folds", default=str(DEFAULT_FOLDS))
+    clogp.add_argument("--include-fold-id", type=int, default=None,
+                       help="cache only this fold's bases from the requested source split")
+    clogp.add_argument("--exclude-fold-id", type=int, default=None,
+                       help="cache all except this fold's bases from the requested source split")
+    clogp.add_argument("--output-split", default="",
+                       help="shard under this split name, e.g. fold0, when slicing a source split")
+    clogp.set_defaults(func=command_cache_logits_prep)
+
+    clogf = sub.add_parser("cache-logits-forward", help="GPU-only: run cache-logits-prep's shards through the classifier")
+    clogf.add_argument("--tag", default="charpost_t1L_ft")
+    clogf.add_argument("--model-dir", default=str(CHARPOST_DIR / "charpost_t1L_ft"))
+    clogf.add_argument("--init-ckpt", default="")
+    clogf.add_argument("--tile", type=int, default=1)
+    clogf.add_argument("--splits", default="val,test")
+    clogf.add_argument("--device", default="auto")
+    clogf.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True)
+    clogf.add_argument("--tta", choices=TTA_MODES, default="none",
+                       help="must match the --tta/--tta-pixels/--tta-scale used for cache-logits-prep")
+    clogf.add_argument("--tta-pixels", type=int, default=4)
+    clogf.add_argument("--tta-scale", type=float, default=0.04)
+    clogf.add_argument("--output-split", default="",
+                       help="read shards from this split name, e.g. fold0, matching cache-logits-prep")
+    clogf.set_defaults(func=command_cache_logits_forward)
 
     return parser
 

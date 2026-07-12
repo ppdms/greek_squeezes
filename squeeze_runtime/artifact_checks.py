@@ -5,7 +5,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-FEATURE_VERSION = 'lattice_length_delta_v2'
+# Must match charpost_ranker.FEATURE_VERSION -- the candidate builder stamps that
+# value into the manifest and these readiness checks compare against this one.
+FEATURE_VERSION = 'ppm_interpolation_v2'
 
 
 @dataclass(frozen=True)
@@ -253,7 +255,7 @@ class ArtifactChecks:
             'tag_prefix': self.cfg.charpost_oof_prefix,
             'folds': list(self.cfg.folds),
             'orders': list(self.cfg.charpost_orders),
-            'proposal_weights': [0.0, 0.25, 0.5, 0.75, 1.0],
+            'proposal_weights': [1.0],
             'beam': 256,
             'char_topk': 8,
             'feature_version': FEATURE_VERSION,
@@ -334,7 +336,7 @@ class ArtifactChecks:
         data = self.read_json_or_none(path)
         if not isinstance(data, dict):
             return False
-        final_fit = data.get('final_fit') or {}
+        final_selector = data.get('final_selector') or {}
         best = data.get('best') or {}
         return (
             data.get('features') == self.cfg.charpost_ranker_features.split(',')
@@ -342,10 +344,10 @@ class ArtifactChecks:
             and self.candidate_manifest_ok(self.cfg.candidates_json)
             and isinstance(best, dict)
             and best.get('cer') is not None
-            and isinstance(final_fit, dict)
-            and not final_fit.get('failed')
-            and set(final_fit.get('features') or final_fit.get('cols') or []) == set(self.cfg.charpost_ranker_features.split(','))
-            and 'coef' in final_fit
+            and isinstance(final_selector, dict)
+            and final_selector.get('method') == 'visual_ppm_interpolation'
+            and final_selector.get('features') == self.cfg.charpost_ranker_features.split(',')
+            and isinstance(final_selector.get('lm_weight'), (int, float))
             and self.newer_than(path, [self.cfg.candidates_json])
         )
 
@@ -356,6 +358,12 @@ class ArtifactChecks:
     def final_charpost_logits_ready(self, split: str, model_dir: Path) -> bool:
         logits = self.cfg.charpost_dir / f'{self.cfg.charpost_all_train_tag}__{split}_logits.npz'
         return self.charpost_logits_ready(logits, tag=self.cfg.charpost_all_train_tag, split=split, model_dir=model_dir, include_fold_id=None)
+
+    def selector_lm_weight(self) -> float | None:
+        data = self.read_json_or_none(self.cfg.ranker_json)
+        selector = (data.get('final_selector') or {}) if isinstance(data, dict) else {}
+        value = selector.get('lm_weight')
+        return float(value) if isinstance(value, (int, float)) else None
 
     def decode_ready(self, path: Path, split: str) -> bool:
         data = self.read_json_or_none(path)
@@ -368,10 +376,11 @@ class ArtifactChecks:
             data.get('tag') == self.cfg.charpost_all_train_tag
             and data.get('split') == split
             and data.get('orders') == list(self.cfg.charpost_orders)
-            and data.get('proposal_weights') == [0.0, 0.25, 0.5, 0.75, 1.0]
+            and data.get('proposal_weights') == [1.0]
             and data.get('beam') == 256
             and data.get('char_topk') == 8
             and data.get('features') == self.cfg.charpost_ranker_features.split(',')
+            and data.get('lm_weight') == self.selector_lm_weight()
             and self.same_pathish(str(data.get('ranker', '')), self.cfg.ranker_json)
             and isinstance(predictions, list)
             and isinstance(transcripts, list)
@@ -392,10 +401,11 @@ class ArtifactChecks:
             and int(data.get('row_shard_count') or -1) == shards
             and int(data.get('row_shard_id') or -1) == shard
             and data.get('orders') == list(self.cfg.charpost_orders)
-            and data.get('proposal_weights') == [0.0, 0.25, 0.5, 0.75, 1.0]
+            and data.get('proposal_weights') == [1.0]
             and data.get('beam') == 256
             and data.get('char_topk') == 8
             and data.get('features') == self.cfg.charpost_ranker_features.split(',')
+            and data.get('lm_weight') == self.selector_lm_weight()
             and self.same_pathish(str(data.get('ranker', '')), self.cfg.ranker_json)
             and isinstance(predictions, list)
             and len(predictions) > 0

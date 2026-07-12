@@ -189,13 +189,22 @@ def jupyter():
 def run_all():
     """Headlessly execute every code cell of greek_squeezes.ipynb in order.
 
-    `modal run modal_notebook.py::run_all` runs the whole pipeline with no
-    browser and no exposed port: cells execute in one kernel, artifacts are
-    written to the mounted volume (persisted on exit), and cell outputs /
-    tracebacks stream to the terminal. Use this once the notebook is stable and
-    you just want it run end-to-end on the GPU.
+    `modal run --detach modal_notebook.py::run_all` runs the whole pipeline
+    with no browser and no exposed port: cells execute in one kernel, cell
+    outputs / tracebacks stream to the terminal, and the executed notebook
+    plus every report figure are persisted to the mounted volume (committed
+    before exit, so they survive disconnects / preemption). Use this once the
+    notebook is stable and you just want it run end-to-end on the GPU.
+
+    Recover the outputs locally afterwards with:
+        uvx modal volume get greek-squeezes-data /notebook_run . --force
+    (the destination must be an existing directory; passing a fresh path
+    trips a CLI bug that leaves a zero-byte `notebook_run` file behind).
+    The downloaded `notebook_run/` holds `greek_squeezes__executed.ipynb`
+    (the notebook with all outputs baked in) and `figs/*.png` (the figures
+    `report/report.tex` includes).
     """
-    import nbformat
+    import nbformat, shutil, pathlib
     from nbclient import NotebookClient
     nb = nbformat.read(NB_REMOTE, as_version=4)
     client = NotebookClient(
@@ -203,6 +212,31 @@ def run_all():
         resources={"metadata": {"path": "/root"}},
     )
     client.execute()
-    out = f"{VOL_MOUNT}/greek_squeezes__executed.ipynb"
-    nbformat.write(nb, out)
-    print(f"done; executed notebook with outputs -> {out}")
+
+    # Persist the executed notebook + every report figure onto the volume.
+    # Figures are written to /root/report/figs (REPO_ROOT/report/figs) on the
+    # ephemeral container FS, so they must be copied to the volume before exit
+    # or they are lost when the container tears down.
+    run_dir = pathlib.Path(f"{VOL_MOUNT}/notebook_run")
+    figs_dst = run_dir / "figs"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    nb_out = run_dir / "greek_squeezes__executed.ipynb"
+    nbformat.write(nb, nb_out)
+
+    n_figs = 0
+    figs_src = pathlib.Path("/root/report/figs")
+    if figs_src.is_dir():
+        # Clear first so figures whose builders no longer exist don't linger
+        # on the volume across runs.
+        if figs_dst.is_dir():
+            shutil.rmtree(figs_dst)
+        figs_dst.mkdir(parents=True, exist_ok=True)
+        for p in figs_src.glob("*.png"):
+            shutil.copy2(p, figs_dst / p.name)
+            n_figs += 1
+
+    vol.commit()  # flush writes so they survive container exit / preemption
+    print(f"done; executed notebook -> {nb_out}")
+    print(f"copied {n_figs} figure(s) -> {figs_dst}")
+    print("recover locally with: "
+          "uvx modal volume get greek-squeezes-data /notebook_run . --force")

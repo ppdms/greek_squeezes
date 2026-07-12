@@ -387,7 +387,7 @@ class CharpostPipeline:
             ranker=self.cfg.ranker_json,
             orders=self.order_arg,
             lm_template=str(self.cfg.charpost_dir / 'train_lm_order{order}_train' / 'lm.json'),
-            proposal_weights='0,0.25,0.5,0.75,1.0',
+            proposal_weights='1.0',
             beam=256,
             char_topk=8,
             device=device,
@@ -419,7 +419,11 @@ class CharpostPipeline:
                 'chars': best.get('chars'),
                 'oracle_cer': best.get('oracle_cer'),
             })
-            print('Charpost scorer:', (data.get('final_fit') or {}).get('method'))
+            selector = data.get('final_selector') or {}
+            print('Charpost selector:', {
+                'method': selector.get('method'),
+                'lm_weight': selector.get('lm_weight'),
+            })
         for split in ('val', 'test'):
             path = self.cfg.charpost_dir / f'{self.cfg.charpost_all_train_tag}__{split}_decode.json'
             if path.exists():

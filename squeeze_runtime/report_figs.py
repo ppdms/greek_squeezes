@@ -30,7 +30,7 @@ WORK = Path(os.environ.get("SQUEEZE_WORK_DIR", "data"))
 FIGS_DIR = Path("report") / "figs"
 
 # Frozen production candidate-search recipe (see ArtifactChecks defaults).
-PROPOSAL_WEIGHTS = (0.0, 0.25, 0.5, 0.75, 1.0)
+PROPOSAL_WEIGHTS = (1.0,)
 BEAM = 256
 CHAR_TOPK = 8
 
@@ -79,48 +79,6 @@ def _position_ruler(n_pos: int, indent: int = 0) -> list[str]:
     return [pad + tens, pad + ones]
 
 
-def _prod_run_dir(slug: str) -> Path:
-    """``--upload-prod-result-only`` stages summary.json/logits.npz/etc. here."""
-    return WORK / "prod_runs" / slug
-
-
-def _load_prod_cer(slug: str = "trogs26-test") -> float | None:
-    """Read the real production CER from the staged run summary."""
-    path = _prod_run_dir(slug) / "summary.json"
-    if not path.exists():
-        return None
-    data = json.loads(path.read_text(encoding="utf-8"))
-    # _prod_summary (modal_app.py) nests the score under "scored", the same
-    # {"cer", "errors", "chars", "rows"} shape command_decode writes.
-    cer = (data.get("scored") or {}).get("cer")
-    return float(cer) if cer is not None else None
-
-
-def _load_prod_visual_cer(slug: str = "trogs26-test") -> float | None:
-    """Compute the production visual-only-argmax CER from the staged logits.
-
-    Needs no separate "ranker disabled" production run: charpost_ranker's
-    command_decode builds each row's full lattice before the ranker ever
-    runs, so the visual-only argmax is recoverable from the same logits
-    already staged for the deployed decode -- the same dataset as
-    ``_load_prod_cer``, so the two bars are apples-to-apples.
-    """
-    path = _prod_run_dir(slug) / "logits.npz"
-    if not path.exists():
-        return None
-    inputs = _load_logits_npz_path(path)
-    err = chars = 0
-    for row in CR.row_groups(inputs):
-        truth = row["truth"]
-        if not truth:
-            continue
-        lattice = CR.lattice_for_row(inputs, row["indices"], char_topk=0)
-        visual = "".join(max(pos.items(), key=lambda kv: kv[1])[0] for pos in lattice)
-        err += CL.edit_distance(visual, truth)
-        chars += len(truth)
-    return err / chars if chars else None
-
-
 def _load_logits_npz_path(path: Path) -> dict[str, Any]:
     """np.load cached logits from an explicit path (log-softmax in numpy, no torch)."""
     import numpy as np
@@ -148,28 +106,12 @@ def _load_logits_npz(tag: str, split: str) -> dict[str, Any]:
 
 def fig_cer_ladder(candidates_json: Path | str | None = None,
                    ranker_json: Path | str | None = None,
-                   production_cer: float | None = "auto",  # type: ignore[assignment]
-                   prod_slug: str = "trogs26-test",
                    out: Path | str | None = None) -> Path:
-    """OOF decode ladder: visual-only pick vs fitted ridge pick vs lattice
-    oracle, computed from the frozen candidate table; plus, when available,
-    the production visual-only and ranker CERs on the same external dataset.
-
-    ``production_cer="auto"`` (the default) reads the real CER from
-    ``data/prod_runs/<prod_slug>/summary.json``. If that artifact has not
-    been synced locally, the production-ranker bar is omitted entirely --
-    there is no hardcoded stand-in value. Pass an explicit float to override,
-    or ``None`` to omit that bar unconditionally. The production visual-only
-    bar is computed from the cached production logits (see
-    ``_load_prod_visual_cer``) and is likewise omitted when unavailable.
-    """
+    """Recipe-consistent OOF diagnostic: visual-only pick versus tuned
+    interpolation versus the best candidate already present in the pool."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-
-    if production_cer == "auto":
-        production_cer = _load_prod_cer(prod_slug)
-    prod_visual_cer = _load_prod_visual_cer(prod_slug)
 
     cand_path = Path(candidates_json) if candidates_json else _ranker_dir() / "candidates.json"
     rank_path = Path(ranker_json) if ranker_json else _ranker_dir() / "ranker_scores.json"
@@ -189,25 +131,20 @@ def fig_cer_ladder(candidates_json: Path | str | None = None,
         chars += int(rows[0]["chars"])
     rank = json.loads(rank_path.read_text(encoding="utf-8"))
     best = rank.get("best") or {}
-    labels = ["visual-only\nargmax (OOF)", "ridge ranker\n(OOF)", "lattice oracle\n(OOF, best candidate)"]
+    labels = [
+        "visual-only\nargmax (OOF)",
+        "tuned interpolation\n(OOF)",
+        "candidate-pool oracle\n(OOF, truth-selected)",
+    ]
     values = [vis_err / max(chars, 1), float(best.get("cer") or 0.0), oracle_err / max(chars, 1)]
     colors = ["#4878A8", "#C8961E", "#7A9A6D"]
-    if prod_visual_cer is not None:
-        labels.append("visual-only\nargmax (prod)")
-        values.append(float(prod_visual_cer))
-        colors.append("#7793B0")
-    if production_cer is not None:
-        labels.append("ridge ranker\n(prod)")
-        values.append(float(production_cer))
-        colors.append("#8A5A83")
-    fig, ax = plt.subplots(figsize=(7.2, 3.9))
+    fig, ax = plt.subplots(figsize=(6.4, 3.9))
     bars = ax.bar(labels, values, color=colors, width=0.62)
     for bar, val in zip(bars, values):
         ax.text(bar.get_x() + bar.get_width() / 2, val, f"{val:.4f}",
                 ha="center", va="bottom", fontsize=9)
     ax.set_ylabel("CER")
-    ax.set_title("Where the charpost layer earns its CER "
-                 "(first 3 bars: OOF folds; last bars: trogs26-test production)", fontsize=10)
+    ax.set_title("OOF decoding: visual evidence, tuned selection, and candidate-pool bound", fontsize=10)
     ax.spines[["top", "right"]].set_visible(False)
     fig.tight_layout()
     path = _save(fig, "charpost_cer_ladder.png", out)
@@ -215,9 +152,9 @@ def fig_cer_ladder(candidates_json: Path | str | None = None,
     return path
 
 
-def fig_ranker_weights(ranker_json: Path | str | None = None,
-                       out: Path | str | None = None) -> Path:
-    """Standardized ridge coefficients of the production row ranker."""
+def fig_selector_tuning(ranker_json: Path | str | None = None,
+                        out: Path | str | None = None) -> Path:
+    """OOF CER curve used to choose the production interpolation weight."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -225,19 +162,26 @@ def fig_ranker_weights(ranker_json: Path | str | None = None,
     rank_path = Path(ranker_json) if ranker_json else _ranker_dir() / "ranker_scores.json"
     if not rank_path.exists():
         raise FileNotFoundError(str(rank_path))
-    fit = CR.load_ranker_fit(rank_path)
-    cols = list(fit["features"])
-    coef = [float(c) for c in fit["coef"]]
-    order = sorted(range(len(cols)), key=lambda i: coef[i])
+    data = json.loads(rank_path.read_text(encoding="utf-8"))
+    curve = list(data.get("tuning_curve") or [])
+    if not curve:
+        raise ValueError(f"selector JSON has no tuning_curve: {rank_path}")
+    selector = CR.load_selector(rank_path)
+    weights = [float(rec["lm_weight"]) for rec in curve]
+    cers = [float(rec["cer"]) for rec in curve]
+    chosen = float(selector["lm_weight"])
+    chosen_idx = min(range(len(weights)), key=lambda i: abs(weights[i] - chosen))
     fig, ax = plt.subplots(figsize=(6.8, 3.6))
-    ax.barh([cols[i] for i in order], [coef[i] for i in order],
-            color=["#4878A8" if coef[i] >= 0 else "#A85454" for i in order])
-    ax.axvline(0, color="0.3", lw=0.8)
-    ax.set_xlabel("standardized ridge coefficient (target: -edit distance)")
-    ax.set_title("Learned row-ranker weights over candidate features", fontsize=10)
+    ax.plot(weights, cers, color="#4878A8", lw=1.8)
+    ax.scatter([chosen], [cers[chosen_idx]], color="#C8961E", s=38, zorder=3,
+               label=rf"selected $\lambda={chosen:g}$")
+    ax.set_xlabel(r"PPM weight $\lambda$ in visual_sum + $\lambda$ ppm_sum")
+    ax.set_ylabel("OOF CER")
+    ax.set_title("Production selector: direct OOF CER tuning", fontsize=10)
+    ax.legend(frameon=False, fontsize=8)
     ax.spines[["top", "right"]].set_visible(False)
     fig.tight_layout()
-    path = _save(fig, "charpost_ranker_weights.png", out)
+    path = _save(fig, "charpost_selector_tuning.png", out)
     plt.close(fig)
     return path
 
@@ -307,10 +251,23 @@ def find_example_row(tag: str = "all_train", split: str = "test",
     rank_path = Path(ranker_json) if ranker_json else _ranker_dir() / "ranker_scores.json"
     if not rank_path.exists():
         raise FileNotFoundError(str(rank_path))
-    fit = CR.load_ranker_fit(rank_path)
+    selector = CR.load_selector(rank_path)
     template = lm_template or str(_charpost_dir() / "train_lm_order{order}_train" / "lm.json")
-    orders = (6, 10, 12)
-    lms = {order: CL.load_charpost_lm(template.format(order=order)) for order in orders}
+    # The deployed (ppm_unified) recipe uses a SINGLE count model -- the deepest
+    # order -- for both proposals and the ranker feature. Discover the deepest
+    # available order and use only it, so leftover lower-order dirs from the
+    # prior multi-order recipe cannot widen the candidate pool away from
+    # production.
+    import re
+    orders = tuple(sorted(
+        int(m.group(1))
+        for d in _charpost_dir().glob("train_lm_order*_train")
+        if (m := re.search(r"order(\d+)_train$", d.name))
+    ))
+    if not orders:
+        raise FileNotFoundError(f"no train_lm_order*_train LMs under {_charpost_dir()}")
+    order = max(orders)
+    lms = {order: CL.CharPostPPMLM(CL.load_charpost_lm(template.format(order=order)))}
     inputs = _load_logits_npz(tag, split)
     rows = CR.row_groups(inputs)[:max_rows_scanned]
     if not rows:
@@ -321,12 +278,13 @@ def find_example_row(tag: str = "all_train", split: str = "test",
         proposal = CR.lattice_for_row(inputs, row["indices"], char_topk=CHAR_TOPK)
         pool = CR.candidate_pool(proposal, lms, list(PROPOSAL_WEIGHTS), BEAM, CHAR_TOPK)
         feats = {t: CR.candidate_features(t, lattice, lms) for t in pool}
-        scores = {t: CR.score_serialized_fit(fit, feats[t]) for t in pool}
+        scores = {t: CR.score_serialized_selector(selector, feats[t]) for t in pool}
         chosen = max(pool, key=lambda t: scores[t])
         visual = "".join(max(pos.items(), key=lambda kv: kv[1])[0] for pos in lattice)
         return {"row": row, "lattice": lattice, "pool": pool, "feats": feats,
                 "scores": scores, "chosen": chosen, "visual": visual,
-                "truth": str(row["truth"]), "alphabet": inputs["alphabet"], "lms": lms}
+                "truth": str(row["truth"]), "alphabet": inputs["alphabet"], "lms": lms,
+                "selector": selector}
 
     fallback = None
     for row in rows:
@@ -358,14 +316,15 @@ def mechanism_walkthrough(rec: dict[str, Any] | None = None, **find_kwargs: Any)
     visual_sum = sum(pos[visual[i]] for i, pos in enumerate(lattice))
     print(f"  -> {visual!r}  visual_sum={visual_sum:+.2f}")
 
-    print("\nStep 3 - LM-weighted beam proposals (order-6 train-only LM):")
-    lm6 = rec["lms"][6]
+    order = max(rec["lms"])
+    lm = rec["lms"][order]
+    print(f"\nStep 3 - LM-weighted beam proposals (order-{order} train-only LM, PPM-C):")
     for w in PROPOSAL_WEIGHTS:
-        beams = CL.decode_lattice(lattice, lm6, w, BEAM, char_topk=CHAR_TOPK)
+        beams = CL.decode_lattice(lattice, lm, w, BEAM, char_topk=CHAR_TOPK)
         top = beams[0]
         print(f"  weight {w:>4}: top beam {top[0]!r} (score {top[1]:+.2f})")
 
-    print("\nStep 4 - candidate pool (union over weights and LM orders, deduplicated):")
+    print("\nStep 4 - candidate pool (visual beam + PPM-C-weighted beam, deduplicated):")
     pool = rec["pool"]
     shown = sorted({t for t in pool if t in (truth, visual, chosen)})
     print(f"  {len(pool)} candidates; the ones that matter here: {shown}")
@@ -379,14 +338,15 @@ def mechanism_walkthrough(rec: dict[str, Any] | None = None, **find_kwargs: Any)
     for line in ruler:
         print(line)
     feats = rec["feats"]
-    cols = ["visual_sum", "mean_char_logprob", "length", "length_delta", "lm6_sum"]
+    cols = ["visual_sum", "ppm_sum"]
     header = f"  {'candidate':<12}" + "".join(f"{c:>20}" for c in cols)
     print(header)
     for text in sorted(pool, key=lambda t: feats[t]["visual_sum"], reverse=True)[:6]:
         f = feats[text]
         print(f"  {text:<12}" + "".join(f"{f[c]:>20.3f}" for c in cols))
 
-    print("\nStep 6 - ridge scores (production final_fit from ranker_scores.json):")
+    lm_weight = float(rec["selector"]["lm_weight"])
+    print(f"\nStep 6 - interpolation scores (visual_sum + {lm_weight:g} * ppm_sum):")
     for line in ruler:
         print(line)
     scores = rec["scores"]
@@ -394,7 +354,7 @@ def mechanism_walkthrough(rec: dict[str, Any] | None = None, **find_kwargs: Any)
         marker = " <- chosen" if text == chosen else ""
         print(f"  {text:<12} score={scores[text]:+.3f}{marker}")
 
-    print(f"\nResult: visual-only read {visual!r}; the ranker selects {chosen!r} (truth {truth!r}).")
+    print(f"\nResult: visual-only read {visual!r}; the selector chooses {chosen!r} (truth {truth!r}).")
     return rec
 
 
@@ -402,7 +362,7 @@ def fig_lattice_graph(rec: dict[str, Any] | None = None, top_k: int = 4,
                       out: Path | str | None = None, context: int = 2,
                       max_positions: int = 6, **find_kwargs: Any) -> Path:
     """Draw a real row's lattice as a graph, windowed to where the
-    visual-only argmax and the ranker-selected (or true) row actually
+    visual-only argmax and the selector-selected (or true) row actually
     disagree, plus a small context margin, so long rows stay legible instead
     of shrinking to an illegible strip; the full row is always visible in the
     companion `fig_lattice_example` heatmap. Top-k candidate letters per
@@ -467,7 +427,7 @@ def fig_lattice_graph(rec: dict[str, Any] | None = None, top_k: int = 4,
     paths = [(visual_w, "--", "#4878A8", f"visual-only argmax: {visual}")]
     if truth_w and truth_w != chosen_w:
         paths.append((truth_w, ":", "#3F9142", f"ground truth: {truth}"))
-    paths.append((chosen_w, "-", "#C8961E", f"ranker-selected row: {chosen}"))
+    paths.append((chosen_w, "-", "#C8961E", f"selector-selected row: {chosen}"))
     for text, style, color, label in paths:
         xs = [coord[(li, text[li])][0] for li in range(min(m, len(text))) if (li, text[li]) in coord]
         ys = [coord[(li, text[li])][1] for li in range(min(m, len(text))) if (li, text[li]) in coord]
@@ -507,7 +467,7 @@ def fig_lattice_graph(rec: dict[str, Any] | None = None, top_k: int = 4,
 def fig_lattice_example(rec: dict[str, Any] | None = None, out: Path | str | None = None,
                         **find_kwargs: Any) -> Path:
     """Real-data decode walkthrough for one row: full-alphabet lattice
-    heatmap with the truth / visual-only / ranker-selected paths, plus the
+    heatmap with the truth / visual-only / selector-selected paths, plus the
     top-scored candidates and their features."""
     import matplotlib
     matplotlib.use("Agg")
@@ -516,7 +476,7 @@ def fig_lattice_example(rec: dict[str, Any] | None = None, out: Path | str | Non
 
     rec = rec or find_example_row(**find_kwargs)
     alphabet = rec["alphabet"]
-    fit_cols = ["visual_sum", "mean_char_logprob", "length", "length_delta", "lm6_sum", "lm10_sum", "lm12_sum"]
+    fit_cols = ["visual_sum", "ppm_sum"]
     lattice = rec["lattice"]
     n_pos = len(lattice)
     grid = np.full((len(alphabet), n_pos), -12.0)
@@ -542,7 +502,7 @@ def fig_lattice_example(rec: dict[str, Any] | None = None, out: Path | str | Non
             ax.plot(i, alphabet.index(rec["chosen"][i]), "x", ms=8, c="#FFD24A", mew=2.0)
     base, ridx = rec["row"]["base"], rec["row"]["row_idx"]
     ax.set_title(f"row lattice {base} row {ridx}  "
-                 f"(square=truth, circle=visual argmax, x=ranker choice)", fontsize=9)
+                 f"(square=truth, circle=visual argmax, x=selector choice)", fontsize=9)
     fig.colorbar(im, ax=ax, fraction=0.03, pad=0.01, label="log P(char | crop)")
 
     axt = fig.add_subplot(gs[1])
@@ -553,9 +513,9 @@ def fig_lattice_example(rec: dict[str, Any] | None = None, out: Path | str | Non
              f"truth : {rec['truth']}", f"visual: {rec['visual']}", f"chosen: {rec['chosen']}", ""]
     # Candidate strings start at column 0 and are all exactly n_pos characters
     # (one beam step per lattice position), so an unindented ruler lines up
-    # with every row below it regardless of the ridge/feature columns' width.
+    # with every row below it regardless of the score/feature columns' width.
     lines.extend(_position_ruler(n_pos))
-    lines.append(f"{'candidate':<{max(10, n_pos + 2)}}{'ridge':>9}  " +
+    lines.append(f"{'candidate':<{max(10, n_pos + 2)}}{'score':>9}  " +
                  "".join(f"{c:>{max(len(c) + 2, 9)}}" for c in cols))
     for text in sorted(rec["pool"], key=lambda t: rec["scores"][t], reverse=True)[:6]:
         f = rec["feats"][text]
@@ -697,7 +657,7 @@ def fig_cross_attention(ckpt: Path | str | None = None, n: int = 2,
 
     from trocr_model import fix_trocr_meta
 
-    processor = TrOCRProcessor.from_pretrained(ckpt)
+    processor = TrOCRProcessor.from_pretrained(ckpt, use_fast=False)
     model = VisionEncoderDecoderModel.from_pretrained(ckpt, low_cpu_mem_usage=False).to(device)
     model.config.decoder_start_token_id = processor.tokenizer.cls_token_id
     model.config.pad_token_id = processor.tokenizer.pad_token_id
@@ -762,10 +722,10 @@ def fig_cross_attention(ckpt: Path | str | None = None, n: int = 2,
     return path
 
 
-def build_all(production_cer: float | None = "auto") -> None:  # type: ignore[assignment]
+def build_all() -> None:
     """Build every report figure that the local artifact tree supports."""
-    maybe(fig_cer_ladder, production_cer=production_cer)
-    maybe(fig_ranker_weights)
+    maybe(fig_cer_ladder)
+    maybe(fig_selector_tuning)
     maybe(fig_confusion)
     example = maybe(find_example_row)
     if example is not None:

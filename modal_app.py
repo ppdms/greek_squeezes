@@ -10,6 +10,7 @@ import sys
 import argparse
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -20,12 +21,12 @@ VOL_DIR = Path('/root/work')
 DATA_DIR = VOL_DIR / 'data'
 HF_CACHE = VOL_DIR / 'hf_cache'
 SMOKE_DIR = DATA_DIR / '_smoke'
-BUCKET_URI = 'hf://buckets/papadimas/greek_squeezes'
+BUCKET_URI = 'hf://buckets/papadimas/greek_squeezes/ppm_unified'
 HF_DATASET = 'papadimas/trogs-greek-squeezes'
 PROD_DEFAULT_SOURCE = 'papadimas/trogs-26-test-images'
 GPU_DEFAULT = 'A100'
 FOLDS = tuple(range(5))
-ORDERS = (6, 10, 12)
+ORDERS = (12,)
 PROD_OUTPUT_SPLIT = 'prod'
 PROD_INPUT_ROOT = DATA_DIR / 'prod_inputs'
 PROD_SOURCE_CACHE = VOL_DIR / 'prod_sources'
@@ -53,6 +54,18 @@ LOCK_HEARTBEAT_SECONDS = 120
 LOCK_STALE_SECONDS = 26 * 60 * 60
 LOCK_POLL_SECONDS = 20
 _VOL_COMMIT_LOCK = threading.Lock()
+
+# Image-cache tar shards. The dual-light image cache is ~60k tiny files; storing
+# it loose makes `hf sync` crawl 60k objects. Instead we round-robin the files
+# into IMAGE_CACHE_ARCHIVE_SHARDS tar shards so the bucket holds a handful of
+# large objects. Upload builds the shards; prepare restores them by untarring.
+IMAGE_CACHE_ARCHIVE_DIR = 'archives'
+IMAGE_CACHE_ARCHIVE_PREFIX = 'image_cache_shard'
+IMAGE_CACHE_ARCHIVE_META_DIR = '_archive_meta'
+IMAGE_CACHE_ARCHIVE_PARTIAL_SUFFIX = '.partial'
+IMAGE_CACHE_ARCHIVE_SHARDS = 16
+IMAGE_CACHE_ARCHIVE_WORKERS = 8
+IMAGE_CACHE_REL = 'data/character_posterior/image_cache'
 
 _ART = 'https://scholarworks.smith.edu/cgi/viewcontent.cgi?filename={}&article=1017&context=dds_data&type=additional'
 SCHOLARWORKS_FILES = {
@@ -550,7 +563,11 @@ def _require_prod_frozen_artifacts(pipeline) -> None:
         if not pipeline.artifacts.final_charpost_lm_ready(lm_path, order):
             missing.append(f'order-{order} LM: {lm_path}')
     if missing:
-        raise FileNotFoundError('prod frozen artifacts are missing; run/sync the full pipeline first:\n  ' + '\n  '.join(missing))
+        raise FileNotFoundError(
+            'prod frozen artifacts are missing or stale on the Modal volume; '
+            'run --score-only for selector/decode artifacts or --run for the full charpost stack:\n  '
+            + '\n  '.join(missing)
+        )
 
 
 def _prod_logits_ready(path: Path) -> bool:
@@ -574,9 +591,17 @@ def _prod_decode_matches(path: Path, *, tag: str, split: str, shard: int | None 
         return False
     if data.get('orders') != list(ORDERS):
         return False
-    if data.get('proposal_weights') != [0.0, 0.25, 0.5, 0.75, 1.0]:
+    if data.get('proposal_weights') != [1.0]:
         return False
     if data.get('beam') != 256 or data.get('char_topk') != 8:
+        return False
+    if data.get('ranker_method') != 'visual_ppm_interpolation':
+        return False
+    if data.get('features') != ['visual_sum', 'ppm_sum']:
+        return False
+    ranker = _read_json(DATA_DIR / 'character_posterior' / 'oof_ranker' / 'ranker_scores.json')
+    selector = (ranker.get('final_selector') or {}) if isinstance(ranker, dict) else {}
+    if data.get('lm_weight') != selector.get('lm_weight'):
         return False
     row_shard_id = data.get('row_shard_id')
     row_shard_count = data.get('row_shard_count')
@@ -598,7 +623,11 @@ def _write_prod_transcripts(decode_path: Path, out_dir: Path) -> Path:
     pred_dir.mkdir(parents=True, exist_ok=True)
     for rec in transcripts:
         base = _prod_safe_base(str(rec.get('base') or 'base'))
-        text = str(rec.get('text') or '').rstrip() + '\n'
+        # No trailing newline: contest_evaluation_v2 builds its reference with
+        # '\n'.join(rows) and aligns the raw file contents, so a final '\n'
+        # scores as +1 insertion per squeeze. (v1's reference ended with '\n',
+        # which is why these files used to end with one.)
+        text = str(rec.get('text') or '').rstrip()
         (pred_dir / f'{base}_transcript.txt').write_text(text, encoding='utf-8')
     return pred_dir
 
@@ -705,12 +734,188 @@ def _smoke_final_lm_template() -> str:
     return str(SMOKE_DIR / 'final_lm_order{order}_train' / 'lm.json')
 
 
+def _image_cache_file_entries() -> list[str]:
+    root = DATA_DIR / 'character_posterior' / 'image_cache'
+    if not root.exists():
+        return []
+    return [str(p.relative_to(VOL_DIR)) for p in sorted(root.rglob('*')) if p.is_file()]
+
+
+def _build_one_archive(*, archive: Path, build_cmd, log_dir: Path, label: str) -> None:
+    """Build a single tar, preempt-safely: write <name>.tar.partial then rename."""
+    if archive.exists():
+        print(f'{label}: exists, skip -> {archive.name}', flush=True)
+        return
+    partial = archive.with_name(archive.name + IMAGE_CACHE_ARCHIVE_PARTIAL_SUFFIX)
+    partial.unlink(missing_ok=True)
+    log_path = log_dir / (archive.name + '.log')
+    print(f'{label}: start -> {archive.name}', flush=True)
+    with log_path.open('wb') as logf:
+        proc = subprocess.run(build_cmd(partial), stdout=logf, stderr=subprocess.STDOUT)
+    if proc.returncode != 0:
+        partial.unlink(missing_ok=True)
+        tail = ''
+        try:
+            tail = log_path.read_bytes()[-4000:].decode('utf-8', 'replace')
+        except Exception:
+            pass
+        raise RuntimeError(f'{label} failed rc={proc.returncode}; see {log_path}\n--- tail ---\n{tail}')
+    os.replace(partial, archive)
+    print(f'{label}: done ({archive.stat().st_size / (1024 ** 2):.1f} MiB) -> {archive.name}', flush=True)
+
+
+def _run_parallel(commands: list[list[str]], *, label: str) -> None:
+    if not commands:
+        return
+    procs = [(idx, subprocess.Popen(cmd), cmd) for idx, cmd in enumerate(commands, 1)]
+    failures = []
+    for idx, proc, cmd in procs:
+        if proc.wait() != 0:
+            failures.append(f'{idx}: rc={proc.returncode} cmd={" ".join(cmd)}')
+    if failures:
+        raise RuntimeError(f'{label} failed: ' + '; '.join(failures))
+
+
+def _archive_sig(paths: list[Path]) -> dict:
+    return {'archives': [
+        {'path': str(p), 'size': p.stat().st_size, 'mtime_ns': p.stat().st_mtime_ns}
+        for p in paths
+    ]}
+
+
+def _image_cache_source_sig(entries: list[str]) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    for rel in entries:
+        try:
+            st = (VOL_DIR / rel).stat()
+            h.update(f'{rel}\0{st.st_size}\0{st.st_mtime_ns}\n'.encode())
+        except OSError:
+            h.update(f'{rel}\0missing\n'.encode())
+    return h.hexdigest()
+
+
+def _create_image_cache_archives(stage: Path, *, shards: int, workers: int) -> None:
+    """Pack data/character_posterior/image_cache into `shards` tar files.
+
+    Files are round-robin assigned to shards, then packed with `tar -T listfile`.
+    Preempt-safe: each shard is written atomically and an already-present shard
+    is skipped, so a re-run only builds the missing ones. If the cache contents
+    or the requested shard count changed since the last archive, stale shards are
+    cleared first so a re-run never uploads a previous cache's tars.
+    """
+    entries = _image_cache_file_entries()
+    if not entries:
+        print('image cache missing or empty; no shards created', flush=True)
+        return
+    stage.mkdir(parents=True, exist_ok=True)
+    meta_dir = VOL_DIR / IMAGE_CACHE_ARCHIVE_META_DIR
+    log_dir = meta_dir / 'logs'
+    log_dir.mkdir(parents=True, exist_ok=True)
+    for p in stage.glob(f'{IMAGE_CACHE_ARCHIVE_PREFIX}*{IMAGE_CACHE_ARCHIVE_PARTIAL_SUFFIX}'):
+        p.unlink(missing_ok=True)
+
+    shard_count = min(max(int(shards), 1), len(entries))
+
+    # Invalidate stale shards when the cache changed, so skip-existing (which
+    # exists for preempt-resume) can't silently republish a previous cache.
+    sig_path = meta_dir / 'image_cache_source.json'
+    src_sig = _image_cache_source_sig(entries)
+    try:
+        prev = json.loads(sig_path.read_text(encoding='utf-8'))
+    except Exception:
+        prev = {}
+    if prev.get('sig') != src_sig or int(prev.get('shard_count', -1)) != shard_count:
+        stale = list(stage.glob(f'{IMAGE_CACHE_ARCHIVE_PREFIX}*.tar'))
+        if stale:
+            print(f'image cache changed; clearing {len(stale)} stale shard(s)', flush=True)
+            for p in stale:
+                p.unlink(missing_ok=True)
+        sig_path.unlink(missing_ok=True)
+
+    print(f'image cache: {len(entries)} files -> {shard_count} shards', flush=True)
+    buckets: list[list[str]] = [[] for _ in range(shard_count)]
+    for idx, entry in enumerate(entries):
+        buckets[idx % shard_count].append(entry)
+
+    specs = []
+    for sid, files in enumerate(buckets):
+        list_path = meta_dir / f'{IMAGE_CACHE_ARCHIVE_PREFIX}{sid:02d}-of-{shard_count:02d}.txt'
+        list_path.write_text('\n'.join(files) + '\n', encoding='utf-8')
+        archive = stage / f'{IMAGE_CACHE_ARCHIVE_PREFIX}{sid:02d}-of-{shard_count:02d}.tar'
+
+        def shard_cmd(out: Path, lp=list_path) -> list[str]:
+            return ['tar', '-C', str(VOL_DIR), '-cf', str(out), '-T', str(lp)]
+        specs.append((f'image shard {sid:02d}/{shard_count}', archive, shard_cmd))
+
+    pending = [(label, arc, cmd) for label, arc, cmd in specs if not arc.exists()]
+    print(f'image shards: {len(specs)} total, {len(specs) - len(pending)} present, '
+          f'{len(pending)} to build with {max(1, workers)} workers', flush=True)
+    if pending:
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+            futs = {ex.submit(_build_one_archive, archive=arc, build_cmd=cmd,
+                              log_dir=log_dir, label=label): label
+                    for label, arc, cmd in pending}
+            for fut in as_completed(futs):
+                if fut.exception() is not None:
+                    raise RuntimeError(f'{futs[fut]} failed: {fut.exception()}')
+                try:
+                    _commit_volume(f'archive {futs[fut]}')
+                except Exception as commit_exc:
+                    print(f'warning: vol.commit after {futs[fut]} failed: {commit_exc}', flush=True)
+    sig_path.write_text(json.dumps({'sig': src_sig, 'shard_count': shard_count},
+                                   sort_keys=True), encoding='utf-8')
+    total_gib = sum(p.stat().st_size for p in stage.glob(f'{IMAGE_CACHE_ARCHIVE_PREFIX}*.tar')) / (1024 ** 3)
+    print(f'image cache archived: {shard_count} shards, {total_gib:.2f} GiB -> {stage}', flush=True)
+
+
+def _restore_image_cache_archives() -> None:
+    archive_dir = VOL_DIR / IMAGE_CACHE_ARCHIVE_DIR
+    shard_archives = sorted(archive_dir.glob(f'{IMAGE_CACHE_ARCHIVE_PREFIX}*-of-*.tar'))
+    if not shard_archives:
+        return
+    marker = DATA_DIR / '.image_cache_archives_restored.json'
+    sig = _archive_sig(shard_archives)
+    try:
+        if marker.exists() and json.loads(marker.read_text(encoding='utf-8')) == sig:
+            print('image cache archives already restored ->', archive_dir, flush=True)
+            return
+    except Exception:
+        pass
+    print(f'restoring {len(shard_archives)} image-cache shards', flush=True)
+    _run_parallel(
+        [['tar', '-C', str(VOL_DIR), '-xf', str(p)] for p in shard_archives],
+        label='restore image shard',
+    )
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps(sig, indent=2, sort_keys=True), encoding='utf-8')
+    print('restored image cache ->', DATA_DIR / 'character_posterior' / 'image_cache', flush=True)
+
+
 def _sync_from_bucket(bucket_uri: str) -> None:
     if not bucket_uri:
         print('bucket sync skipped')
         return
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    _run(['hf', 'sync', bucket_uri, str(VOL_DIR)])
+    # The image cache lives on the bucket as tar shards under archives/, not as
+    # ~60k loose files -- skip any loose copy and reconstruct it by untarring.
+    # `hf sync` prints nothing to a non-TTY until it finishes, and hashing the
+    # volume's existing files can take minutes -- tick so it never looks hung.
+    cmd = ['hf', 'sync', bucket_uri, str(VOL_DIR), '--exclude', f'{IMAGE_CACHE_REL}/**']
+    print(' '.join(cmd), flush=True)
+    start = time.monotonic()
+    proc = subprocess.Popen(cmd)
+    while True:
+        try:
+            proc.wait(timeout=60)
+            break
+        except subprocess.TimeoutExpired:
+            print(f'  bucket sync still running ({time.monotonic() - start:.0f}s elapsed; '
+                  'hf is quiet until done -- comparing/downloading volume files)', flush=True)
+    if proc.returncode:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
+    print(f'bucket sync done in {time.monotonic() - start:.0f}s', flush=True)
+    _restore_image_cache_archives()
 
 
 def _raw_data_ready() -> bool:
@@ -839,8 +1044,10 @@ def _build_pipeline():
         ranker_dir=layout['ranker_dir'],
         candidates_json=layout['ranker_dir'] / 'candidates.json',
         ranker_json=layout['ranker_dir'] / 'ranker_scores.json',
-        ranker_methods='ridge',
-        charpost_ranker_features='visual_sum,mean_char_logprob,length,length_delta,lm6_sum,lm10_sum,lm12_sum',
+        ranker_methods='visual_ppm_interpolation',
+        # The selector directly tunes the single relative weight between visual
+        # evidence and the same PPM-C score used for candidate proposals.
+        charpost_ranker_features='visual_sum,ppm_sum',
         rank_fold_seed=LF.RANK_FOLD_SEED,
     )
 
@@ -1321,7 +1528,7 @@ def _cpu_job_unlocked(kind: str, *, fold: int = -1, order: int = -1, split: str 
             ranker=pipeline.cfg.ranker_json,
             orders=pipeline.order_arg,
             lm_template=str(pipeline.cfg.charpost_dir / 'train_lm_order{order}_train' / 'lm.json'),
-            proposal_weights='0,0.25,0.5,0.75,1.0',
+            proposal_weights='1.0',
             beam=256,
             char_topk=8,
             device='cpu',
@@ -1349,7 +1556,7 @@ def _cpu_job_unlocked(kind: str, *, fold: int = -1, order: int = -1, split: str 
                 ranker=pipeline.cfg.ranker_json,
                 orders=pipeline.order_arg,
                 lm_template=str(pipeline.cfg.charpost_dir / 'train_lm_order{order}_train' / 'lm.json'),
-                proposal_weights='0,0.25,0.5,0.75,1.0',
+                proposal_weights='1.0',
                 beam=256,
                 char_topk=8,
                 device='cpu',
@@ -1773,12 +1980,12 @@ def summary_job() -> dict:
         'ranker_exists': ranker_path.exists(),
         'oof_best': None,
         'oof_folds': [],
-        'final_fit': None,
+        'final_selector': None,
         'decodes': {},
     }
     if isinstance(ranker, dict):
         best = ranker.get('best') or {}
-        final_fit = ranker.get('final_fit') or {}
+        final_selector = ranker.get('final_selector') or {}
         out['oof_best'] = {
             'method': best.get('method'),
             'cer': best.get('cer'),
@@ -1788,10 +1995,10 @@ def summary_job() -> dict:
             'oracle_cer': best.get('oracle_cer'),
         }
         out['oof_folds'] = (best.get('folds') or []) if isinstance(best, dict) else []
-        out['final_fit'] = {
-            'method': final_fit.get('method'),
-            'features': final_fit.get('features') or final_fit.get('cols'),
-            'failed': final_fit.get('failed'),
+        out['final_selector'] = {
+            'method': final_selector.get('method'),
+            'features': final_selector.get('features'),
+            'lm_weight': final_selector.get('lm_weight'),
         }
     for split in ('val', 'test'):
         path = pipeline.cfg.charpost_dir / f'{pipeline.cfg.charpost_all_train_tag}__{split}_decode.json'
@@ -1802,6 +2009,7 @@ def summary_job() -> dict:
                 'source': data.get('source'),
                 'ranker_method': data.get('ranker_method'),
                 'features': data.get('features'),
+                'lm_weight': data.get('lm_weight'),
                 'orders': data.get('orders'),
                 'proposal_weights': data.get('proposal_weights'),
                 'beam': data.get('beam'),
@@ -1865,10 +2073,9 @@ def _prod_eval_unlocked(
         vol.reload()
     except Exception as exc:
         print(f'warning: prod vol.reload skipped: {exc}', flush=True)
-    if bucket_uri:
-        _sync_from_bucket(bucket_uri)
     pipeline = _build_pipeline()
     _require_prod_frozen_artifacts(pipeline)
+    print('prod frozen artifacts ready on volume; production never auto-syncs recipe artifacts', flush=True)
 
     manifest = _stage_prod_dataset(
         source=source,
@@ -1934,7 +2141,7 @@ def _prod_eval_unlocked(
             ranker=pipeline.cfg.ranker_json,
             orders=','.join(str(order) for order in pipeline.cfg.charpost_orders),
             lm_template=str(pipeline.cfg.charpost_dir / 'train_lm_order{order}_train' / 'lm.json'),
-        proposal_weights='0,0.25,0.5,0.75,1.0',
+        proposal_weights='1.0',
         beam=256,
         char_topk=8,
         device='cpu',
@@ -1980,9 +2187,176 @@ def _prod_eval_unlocked(
         decode=decode_path,
         transcripts_dir=transcripts_dir,
     )
+    # Official contest scoring (contest_evaluation_v2): cer / all_cer / opt_cer
+    # over the submission-style transcripts, plus confidence-section coverage
+    # and the v1-vs-v2 row-grouping agreement check. Report-only; a scorer
+    # failure must not invalidate the decode above.
+    try:
+        import official_scoring
+        gt_dir = Path(str(manifest['input_root'])) / 'Annotations' / 'Annotations'
+        summary['official_v2'] = official_scoring.score_run(transcripts_dir, gt_dir)
+    except Exception as exc:  # noqa: BLE001
+        summary['official_v2'] = {'error': f'{type(exc).__name__}: {exc}'}
     (out_dir / 'summary.json').write_text(json.dumps(summary, indent=2, sort_keys=True), encoding='utf-8')
     _commit_volume(f'prod eval {slug}')
     return summary
+
+
+@app.function(image=image, volumes={str(VOL_DIR): vol}, timeout=30 * 60, cpu=2)
+def prod_score_job(name: str) -> dict:
+    """Rescore a finished prod run from its cached decode. No GPU, no
+    frozen-artifact gate: regenerates the submission transcripts from
+    decode.json (current format, no trailing newline), runs the official
+    contest_evaluation_v2 scorer against the staged annotations, and merges
+    the result into the run's summary.json.
+    """
+    _set_env()
+    vol.reload()
+    _build_pipeline()  # puts squeeze_runtime on sys.path and chdirs to APP_DIR
+    slug = _prod_slug(name)
+    paths = _prod_result_paths(slug)
+    decode_path = paths['decode']
+    if not decode_path.exists():
+        cached = sorted(p.name for p in (DATA_DIR / 'character_posterior').glob('prod_*_decode.json'))
+        raise FileNotFoundError(
+            f'no cached prod decode for slug {slug!r}: {decode_path}\n'
+            f'cached prod decodes on the volume: {cached}')
+    gt_dir = PROD_INPUT_ROOT / slug / 'Annotations' / 'Annotations'
+    if not gt_dir.is_dir():
+        raise FileNotFoundError(
+            f'staged prod annotations missing for slug {slug!r}: {gt_dir}\n'
+            're-stage with --prod (same --prod-name) or restore prod_inputs')
+    out_dir = PROD_OUTPUT_ROOT / slug
+    out_dir.mkdir(parents=True, exist_ok=True)
+    transcripts_dir = _write_prod_transcripts(decode_path, out_dir)
+    import official_scoring
+    official = official_scoring.score_run(transcripts_dir, gt_dir)
+    decode_data = _read_json(decode_path)
+    scored = decode_data.get('scored') if isinstance(decode_data, dict) else None
+    summary = _read_json(paths['summary']) if paths['summary'].exists() else {}
+    if not isinstance(summary, dict):
+        summary = {}
+    summary.update({
+        'slug': slug,
+        'decode': str(decode_path),
+        'transcripts_dir': str(transcripts_dir),
+        'scored': scored,
+        'official_v2': official,
+    })
+    paths['summary'].parent.mkdir(parents=True, exist_ok=True)
+    paths['summary'].write_text(json.dumps(summary, indent=2, sort_keys=True), encoding='utf-8')
+    _commit_volume(f'prod rescore {slug}')
+    print(json.dumps({'scored': scored, 'official_v2': official}, indent=2, sort_keys=True), flush=True)
+    return summary
+
+
+@app.function(image=image, volumes={str(VOL_DIR): vol}, timeout=15 * 60, cpu=1)
+def frozen_check_job(repair: bool = False) -> dict:
+    """Diagnose (and optionally repair) the prod frozen-artifact gate.
+
+    `ranker_ready` validates content AND an mtime chain (ranker >= candidates
+    >= every fold logit/LM; shards likewise). A partial bucket sync can
+    re-materialize some of those files with fresh mtimes, making perfectly
+    good frozen artifacts read as "missing". This job reports every link in
+    the chain; with repair=True it re-stamps mtimes in dependency order
+    (shards -> candidates -> ranker), but only when the content checks pass
+    -- it never touches files whose contents look wrong.
+    """
+    _set_env()
+    vol.reload()
+    pipeline = _build_pipeline()
+    cfg = pipeline.cfg
+    checks = pipeline.artifacts
+    ranker = cfg.ranker_json
+    cands = cfg.candidates_json
+    deps = checks.candidate_deps()
+
+    def stat(path: Path) -> dict:
+        try:
+            st = Path(path).stat()
+            return {'exists': True, 'size': st.st_size, 'mtime': st.st_mtime}
+        except OSError:
+            return {'exists': False}
+
+    rdata = checks.read_json_or_none(ranker)
+    cdata = checks.read_json_or_none(cands)
+    manifest = (cdata.get('manifest') or {}) if isinstance(cdata, dict) else {}
+    shard_paths: list[Path] = []
+    if manifest.get('kind') == 'merged_candidate_shards':
+        for item in manifest.get('inputs') or []:
+            stored = Path(str(item.get('path') or ''))
+            shard_paths.append(stored if stored.is_file() else cands.parent / stored.name)
+
+    final_selector = (rdata.get('final_selector') or {}) if isinstance(rdata, dict) else {}
+    content = {
+        'ranker_json': isinstance(rdata, dict),
+        'ranker_features': isinstance(rdata, dict) and rdata.get('features') == cfg.charpost_ranker_features.split(','),
+        'ranker_methods': isinstance(rdata, dict) and rdata.get('methods') == [m.strip() for m in cfg.ranker_methods.split(',') if m.strip()],
+        'ranker_final_selector': (
+            final_selector.get('method') == 'visual_ppm_interpolation'
+            and isinstance(final_selector.get('lm_weight'), (int, float))
+        ),
+        'ranker_best_cer': isinstance(rdata, dict) and (rdata.get('best') or {}).get('cer') is not None,
+        'candidates_json': isinstance(cdata, dict) and bool(cdata.get('records')),
+        'shards_exist': all(p.is_file() for p in shard_paths),
+    }
+    report = {
+        'ranker': {'path': str(ranker), **stat(ranker)},
+        'candidates': {'path': str(cands), **stat(cands)},
+        'shards': [{'path': str(p), **stat(p)} for p in shard_paths],
+        'deps': [{'path': str(p), **stat(p)} for p in deps],
+        'content': content,
+        'mtime_chain': {
+            'candidates_newer_than_deps': checks.newer_than(cands, deps),
+            'ranker_newer_than_candidates': checks.newer_than(ranker, [cands]),
+        },
+        'candidate_manifest_ok': checks.candidate_manifest_ok(cands),
+        'ranker_ready': checks.ranker_ready(ranker),
+    }
+    # Actual recipe stamps, so a mismatch shows WHAT is there, not just that
+    # something failed: the frozen config expects features
+    # cfg.charpost_ranker_features, orders cfg.charpost_orders,
+    # proposal_weights [1.0], and the current candidate feature version.
+    report['expected'] = {
+        'features': cfg.charpost_ranker_features.split(','),
+        'orders': list(cfg.charpost_orders),
+        'proposal_weights': [1.0],
+        'feature_version': __import__('artifact_checks').FEATURE_VERSION,
+    }
+    report['ranker_features_actual'] = rdata.get('features') if isinstance(rdata, dict) else None
+    report['ranker_final_selector'] = final_selector or None
+    report['candidates_manifest_actual'] = {
+        k: manifest.get(k) for k in ('kind', 'orders', 'proposal_weights', 'beam', 'char_topk',
+                                     'feature_version', 'rows', 'candidates', 'created')}
+    if shard_paths:
+        sdata = checks.read_json_or_none(shard_paths[0]) or {}
+        smanifest = sdata.get('manifest') or {}
+        report['shard0_manifest_actual'] = {
+            k: smanifest.get(k) for k in ('orders', 'proposal_weights', 'beam', 'char_topk',
+                                          'feature_version', 'row_shard_count', 'rows',
+                                          'candidates', 'created')}
+    prod_decodes = {}
+    for path in sorted(cfg.charpost_dir.glob('prod_*_decode.json')):
+        d = checks.read_json_or_none(path) or {}
+        prod_decodes[path.name] = {
+            **{k: d.get(k) for k in ('tag', 'split', 'orders', 'proposal_weights', 'features')},
+            'scored': d.get('scored'),
+        }
+    report['prod_decodes'] = prod_decodes
+    if repair:
+        if not all(content.values()):
+            report['repair'] = 'refused: content checks failed -- re-sync from the bucket instead of re-stamping mtimes'
+        else:
+            now = time.time()
+            for path in shard_paths:
+                os.utime(path, (now, now))
+            os.utime(cands, (now + 1, now + 1))
+            os.utime(ranker, (now + 2, now + 2))
+            _commit_volume('repair frozen mtimes')
+            report['repair'] = 'restamped mtimes: shards -> candidates.json -> ranker_scores.json'
+            report['ranker_ready_after_repair'] = checks.ranker_ready(ranker)
+    print(json.dumps(report, indent=2, sort_keys=True), flush=True)
+    return report
 
 
 @app.function(image=image, volumes={str(VOL_DIR): vol}, timeout=10 * 60, cpu=1)
@@ -2013,6 +2387,50 @@ def upload_artifacts(bucket_uri: str = BUCKET_URI) -> str:
     )
 
 
+def _upload_image_cache_archives(
+    bucket_uri: str,
+    *,
+    shards: int = IMAGE_CACHE_ARCHIVE_SHARDS,
+    workers: int = IMAGE_CACHE_ARCHIVE_WORKERS,
+) -> bool:
+    """Pack data/character_posterior/image_cache into tar shards and sync them
+    to bucket/archives/. Returns True if any shard was uploaded."""
+    stage = VOL_DIR / IMAGE_CACHE_ARCHIVE_DIR
+    _create_image_cache_archives(stage, shards=shards, workers=workers)
+    if not any(stage.glob(f'{IMAGE_CACHE_ARCHIVE_PREFIX}*.tar')):
+        return False
+    target_uri = bucket_uri.rstrip('/') + f'/{IMAGE_CACHE_ARCHIVE_DIR}'
+    print('hf sync upload ->', stage, '=>', target_uri, flush=True)
+    _run(['hf', 'sync', str(stage), target_uri])
+    return True
+
+
+@app.function(
+    image=image,
+    volumes={str(VOL_DIR): vol},
+    secrets=[hf_secret],
+    timeout=2 * 60 * 60,
+    cpu=16,
+    retries=JOB_RETRIES,
+)
+def upload_image_cache(
+    bucket_uri: str = BUCKET_URI,
+    archive_shards: int = IMAGE_CACHE_ARCHIVE_SHARDS,
+    archive_workers: int = IMAGE_CACHE_ARCHIVE_WORKERS,
+) -> str:
+    def run() -> str:
+        _set_env()
+        vol.reload()
+        uploaded = _upload_image_cache_archives(
+            bucket_uri, shards=archive_shards, workers=archive_workers)
+        _commit_volume('upload image cache archives')
+        if not uploaded:
+            return 'image cache missing or empty; nothing uploaded'
+        return f'uploaded image cache shards to {bucket_uri}/{IMAGE_CACHE_ARCHIVE_DIR}'
+
+    return _run_locked('upload-image-cache', run)
+
+
 def _upload_artifacts_unlocked(bucket_uri: str = BUCKET_URI) -> str:
     _set_env()
     vol.reload()
@@ -2024,7 +2442,12 @@ def _upload_artifacts_unlocked(bucket_uri: str = BUCKET_URI) -> str:
             continue
         target_uri = bucket_uri.rstrip('/') + f'/data/{name}'
         print('hf sync upload ->', src, '=>', target_uri, flush=True)
-        _run(['hf', 'sync', str(src), target_uri])
+        cmd = ['hf', 'sync', str(src), target_uri]
+        if name == 'character_posterior':
+            # image_cache goes up as tar shards under archives/, not 60k loose files.
+            cmd += ['--exclude', 'image_cache/**']
+        _run(cmd)
+    _upload_image_cache_archives(bucket_uri)
     _commit_volume('upload full artifacts')
     return f'uploaded artifacts to {bucket_uri}'
 
@@ -2292,9 +2715,15 @@ def main(
     status: bool = False,
     summary: bool = False,
     clear_locks: bool = False,
+    check_frozen: bool = False,
+    repair_frozen: bool = False,
+    prod_score_only: bool = False,
     score_only: bool = False,
     upload: bool = False,
     upload_prod_result_only: bool = False,
+    upload_image_cache_only: bool = False,
+    archive_shards: int = IMAGE_CACHE_ARCHIVE_SHARDS,
+    archive_workers: int = IMAGE_CACHE_ARCHIVE_WORKERS,
     skip_line_training: bool = False,
     bucket_uri: str = BUCKET_URI,
     gpu: str = GPU_DEFAULT,
@@ -2326,6 +2755,13 @@ def main(
     if clear_locks:
         print(json.dumps(clear_locks_job.remote(), indent=2, sort_keys=True))
         return
+    if check_frozen or repair_frozen:
+        frozen_check_job.remote(repair=repair_frozen)
+        return
+    if prod_score_only:
+        slug = prod_name or _prod_slug(_prod_repo_id(prod_source) + f'_{prod_source_split}')
+        prod_score_job.remote(slug)
+        return
     if prepare:
         print(prepare_inputs.remote(bucket_uri))
         return
@@ -2342,6 +2778,10 @@ def main(
     if upload_prod_result_only:
         slug = prod_name or _prod_slug(_prod_repo_id(prod_source) + f'_{prod_source_split}')
         print(upload_prod_result.remote(slug, bucket_uri=bucket_uri, include_logits=prod_include_logits))
+        return
+    if upload_image_cache_only:
+        print(upload_image_cache.remote(
+            bucket_uri, archive_shards=archive_shards, archive_workers=archive_workers))
         return
     if prod:
         prod_fn = prod_eval.with_options(gpu=gpu)
@@ -2435,7 +2875,7 @@ def main(
             '--upload to also upload the full artifact tree including charpost classifiers/logits/ranker/decodes at the end; '
             '--skip-line-training restores the old full behavior), '
             '--single-gpu-job oof0 to trial one GPU model, '
-            '--score-only to run the CPU ridge/decode tail, --summary to print CERs, '
+            '--score-only to run the CPU selector/decode tail, --summary to print CERs, '
             '--upload to sync all artifacts, '
             'or --status to inspect caches. Add --bg with --run/--score-only/--full to fire-and-forget '
             '(needs `modal run --detach`).'

@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Candidate tables, ridge scorer fitting, and final charpost decoding."""
+"""Candidate tables, OOF interpolation tuning, and final charpost decoding."""
 from __future__ import annotations
 
 import argparse
 import glob
 import json
-import math
 import os
 import sys
 import time
@@ -21,7 +20,9 @@ import char_lattice as CL  # noqa: E402
 WORK = Path(os.environ.get("SQUEEZE_WORK_DIR", "data"))
 CHARPOST_DIR = WORK / "character_posterior"
 OOF_DIR = CHARPOST_DIR / "oof_ranker"
-FEATURE_VERSION = "lattice_length_delta_v2"
+FEATURE_VERSION = "ppm_interpolation_v2"
+SELECTOR_METHOD = "visual_ppm_interpolation"
+SELECTOR_FEATURES = ["visual_sum", "ppm_sum"]
 
 
 def log(message: str) -> None:
@@ -105,17 +106,10 @@ def lm_sum(text: str, lm: Any) -> float:
 
 def candidate_features(text: str, lattice: list[dict[str, float]], lms: dict[int, Any]) -> dict[str, float]:
     v_sum = visual_sum(text, lattice)
-    rec: dict[str, float] = {
-        "visual_sum": v_sum,
-        "mean_char_logprob": v_sum / max(len(text), 1),
-        "length": float(len(text)),
-        "length_delta": float(len(text) - len(lattice)),
-    }
-    for order, lm in lms.items():
-        score = lm_sum(text, lm)
-        rec[f"lm{order}_sum"] = score
-        rec[f"lm{order}_mean"] = score / max(len(text), 1)
-    return rec
+    # The one-parameter selector uses exactly the two quantities that vary
+    # among candidates in a row. The same PPM-C model also drives proposals.
+    ppm = CL.ppm_c_sum(lms[max(lms)], text)
+    return {"visual_sum": v_sum, "ppm_sum": ppm}
 
 
 def candidate_pool(lattice: list[dict[str, float]], proposal_lms: dict[int, Any], weights: list[float], beam: int,
@@ -159,7 +153,8 @@ def command_build_candidates(args: argparse.Namespace) -> None:
         split = f"fold{fold_id}"
         log(f"building candidates fold={fold_id} tag={tag} split={split}")
         inputs = CL.load_decode_inputs(tag, split, args.device)
-        lms = {order: CL.load_charpost_lm(str(fold_lm_path(order, fold_id, args.fold_lm_template))) for order in orders}
+        lms = {order: CL.CharPostPPMLM(CL.load_charpost_lm(str(fold_lm_path(order, fold_id, args.fold_lm_template))))
+               for order in orders}
         fold_rows = row_groups(inputs)
         selected = [
             (row_no, row)
@@ -195,8 +190,6 @@ def command_build_candidates(args: argparse.Namespace) -> None:
                     "truth": truth,
                     "chars": len(truth),
                     "edit_distance": err,
-                    "target_neg_edit": -float(err),
-                    "target_neg_cer": -float(err) / max(len(truth), 1),
                     **feats,
                 }
                 records.append(rec)
@@ -281,15 +274,13 @@ def candidate_manifest_feature_version_ok(manifest: dict[str, Any]) -> bool:
 
 
 def feature_columns(records: list[dict[str, Any]], requested: str) -> list[str]:
-    if requested:
-        return [part.strip() for part in requested.split(",") if part.strip()]
-    cols = ["visual_sum", "mean_char_logprob", "length", "length_delta"]
-    lm_cols = sorted({key for rec in records for key in rec if key.startswith("lm") and key.endswith("_sum")})
-    return cols + lm_cols
-
-
-def matrix(records: list[dict[str, Any]], cols: list[str]) -> np.ndarray:
-    return np.asarray([[float(rec.get(col, 0.0)) for col in cols] for rec in records], dtype=np.float64)
+    cols = [part.strip() for part in requested.split(",") if part.strip()] if requested else SELECTOR_FEATURES
+    if cols != SELECTOR_FEATURES:
+        raise ValueError(f"selector features must be {','.join(SELECTOR_FEATURES)}; got {','.join(cols)}")
+    missing = [col for col in cols if not all(col in rec for rec in records)]
+    if missing:
+        raise ValueError(f"candidate table is missing selector feature(s): {', '.join(missing)}")
+    return cols
 
 
 def pick_by_scores(records: list[dict[str, Any]], scores: np.ndarray) -> dict[str, Any]:
@@ -330,63 +321,62 @@ def pick_by_scores(records: list[dict[str, Any]], scores: np.ndarray) -> dict[st
     }
 
 
-def fit_score_model(method: str, train_records: list[dict[str, Any]], X_train: np.ndarray, cols: list[str], args: argparse.Namespace) -> Any:
-    from sklearn.linear_model import Ridge
-    from sklearn.pipeline import make_pipeline
-    from sklearn.preprocessing import StandardScaler
-
-    if method != "ridge":
-        raise ValueError(f"unknown method: {method}")
-    y_neg = np.asarray([float(r[args.target]) for r in train_records], dtype=np.float64)
-    return make_pipeline(StandardScaler(), Ridge(alpha=args.alpha)).fit(X_train, y_neg)
+def interpolation_scores(records: list[dict[str, Any]], lm_weight: float) -> np.ndarray:
+    """Score candidates as visual_sum + lm_weight * ppm_sum."""
+    return np.asarray(
+        [float(rec["visual_sum"]) + lm_weight * float(rec["ppm_sum"]) for rec in records],
+        dtype=np.float64,
+    )
 
 
-def predict_scores(model: Any, method: str, X: np.ndarray) -> np.ndarray:
-    return model.predict(X)
+def interpolation_grid_metrics(records: list[dict[str, Any]], lm_weights: np.ndarray) -> dict[str, Any]:
+    """Evaluate a weight grid efficiently, retaining corpus-level CER counts."""
+    by_row: dict[str, list[int]] = defaultdict(list)
+    for idx, rec in enumerate(records):
+        by_row[str(rec["row_key"])].append(idx)
+    visual = np.asarray([float(rec["visual_sum"]) for rec in records], dtype=np.float64)
+    ppm = np.asarray([float(rec["ppm_sum"]) for rec in records], dtype=np.float64)
+    edit = np.asarray([int(rec["edit_distance"]) for rec in records], dtype=np.int64)
+    errors = np.zeros(len(lm_weights), dtype=np.int64)
+    oracle_errors = 0
+    chars = 0
+    for indices in by_row.values():
+        idx = np.asarray(indices, dtype=np.int64)
+        row_scores = visual[idx, None] + ppm[idx, None] * lm_weights[None, :]
+        winners = idx[np.argmax(row_scores, axis=0)]
+        errors += edit[winners]
+        oracle_errors += int(np.min(edit[idx]))
+        chars += int(records[indices[0]]["chars"])
+    return {
+        "errors": errors,
+        "chars": chars,
+        "rows": len(by_row),
+        "oracle_errors": oracle_errors,
+        "oracle_cer": oracle_errors / chars if chars else 0.0,
+    }
 
 
-def serializable_model(model: Any, method: str, cols: list[str]) -> dict[str, Any]:
-    out: dict[str, Any] = {"method": method, "features": cols}
-    scaler = model.named_steps["standardscaler"]
-    estimator = model.named_steps["ridge"]
-    out["mean"] = scaler.mean_.tolist()
-    out["std"] = scaler.scale_.tolist()
-    coef = estimator.coef_
-    out["coef"] = coef[0].tolist() if getattr(coef, "ndim", 1) == 2 and coef.shape[0] == 1 else coef.tolist()
-    intercept = estimator.intercept_
-    out["intercept"] = float(intercept[0]) if hasattr(intercept, "__len__") else float(intercept)
-    out["alpha"] = float(estimator.alpha)
-    return out
+def best_grid_index(errors: np.ndarray) -> int:
+    """Choose the lowest weight among equal-CER grid points."""
+    if errors.size == 0:
+        raise ValueError("empty interpolation grid")
+    return int(np.flatnonzero(errors == np.min(errors))[0])
 
 
-def load_ranker_fit(path: Path) -> dict[str, Any]:
+def load_selector(path: Path) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
-    fit = data.get("final_fit") or {}
-    if not fit:
-        raise SystemExit(f"ranker JSON has no final_fit: {path}")
-    if fit.get("failed"):
-        raise SystemExit(f"ranker final_fit failed for {fit.get('method')}: {fit.get('failed')}")
-    if "coef" not in fit:
-        raise SystemExit(f"ranker final_fit is not a supported linear scorer: {path}")
-    return fit
+    selector = data.get("final_selector") or {}
+    if not selector:
+        raise SystemExit(f"selector JSON has no final_selector: {path}")
+    if selector.get("method") != SELECTOR_METHOD:
+        raise SystemExit(f"unsupported selector method {selector.get('method')!r}: {path}")
+    if selector.get("features") != SELECTOR_FEATURES or "lm_weight" not in selector:
+        raise SystemExit(f"selector JSON has an invalid interpolation specification: {path}")
+    return selector
 
 
-def score_serialized_fit(fit: dict[str, Any], features: dict[str, float]) -> float:
-    cols = list(fit.get("features") or fit.get("cols") or [])
-    if not cols:
-        raise SystemExit("ranker final_fit has no feature list")
-    x = np.asarray([float(features.get(col, 0.0)) for col in cols], dtype=np.float64)
-    mean = np.asarray(fit.get("mean", [0.0] * len(cols)), dtype=np.float64)
-    std = np.asarray(fit.get("std", [1.0] * len(cols)), dtype=np.float64)
-    coef = np.asarray(fit["coef"], dtype=np.float64)
-    if coef.ndim != 1:
-        raise SystemExit(f"unsupported ranker coef shape: {coef.shape}")
-    if not (len(mean) == len(std) == len(coef) == len(cols)):
-        raise SystemExit(
-            f"ranker shape mismatch: features={len(cols)} mean={len(mean)} std={len(std)} coef={len(coef)}"
-        )
-    z = (x - mean) / np.maximum(std, 1e-8)
-    return float(z @ coef + float(fit.get("intercept", 0.0)))
+def score_serialized_selector(selector: dict[str, Any], features: dict[str, float]) -> float:
+    return float(features["visual_sum"]) + float(selector["lm_weight"]) * float(features["ppm_sum"])
 
 
 def lm_paths(orders: list[int], template: str) -> dict[int, Path]:
@@ -404,9 +394,9 @@ def command_decode(args: argparse.Namespace) -> None:
         raise SystemExit("--row-shard-count must be >= 1")
     if not (0 <= args.row_shard_id < args.row_shard_count):
         raise SystemExit("--row-shard-id must satisfy 0 <= id < --row-shard-count")
-    fit = load_ranker_fit(args.ranker)
+    selector = load_selector(args.ranker)
     paths = lm_paths(orders, args.lm_template)
-    lms = {order: CL.load_charpost_lm(str(path)) for order, path in paths.items()}
+    lms = {order: CL.CharPostPPMLM(CL.load_charpost_lm(str(path))) for order, path in paths.items()}
     inputs = CL.load_decode_inputs(args.tag, args.split, args.device)
     all_rows = row_groups(inputs)
     rows = [
@@ -437,7 +427,7 @@ def command_decode(args: argparse.Namespace) -> None:
             cand = {
                 "candidate_index": cand_idx,
                 "text": text,
-                "score": score_serialized_fit(fit, feats),
+                "score": score_serialized_selector(selector, feats),
             }
             if args.keep_features:
                 cand["features"] = feats
@@ -482,8 +472,9 @@ def command_decode(args: argparse.Namespace) -> None:
         "split": args.split,
         "source": inputs.get("source"),
         "ranker": str(args.ranker),
-        "ranker_method": fit.get("method"),
-        "features": list(fit.get("features") or fit.get("cols") or []),
+        "ranker_method": selector.get("method"),
+        "features": list(selector["features"]),
+        "lm_weight": float(selector["lm_weight"]),
         "orders": orders,
         "lm_paths": {str(order): str(path) for order, path in paths.items()},
         "proposal_weights": proposal_weights,
@@ -557,7 +548,7 @@ def command_merge_decodes(args: argparse.Namespace) -> None:
         }
     out = {
         **{key: first.get(key) for key in (
-            "tag", "split", "source", "ranker", "ranker_method", "features",
+            "tag", "split", "source", "ranker", "ranker_method", "features", "lm_weight",
             "orders", "lm_paths", "proposal_weights", "beam", "char_topk",
         )},
         "row_shard_count": expected_shards or len(paths),
@@ -582,66 +573,107 @@ def command_fit_rankers(args: argparse.Namespace) -> None:
     if not args.allow_legacy_candidates and not candidate_manifest_feature_version_ok(manifest):
         raise SystemExit(
             f"candidate table is missing feature_version={FEATURE_VERSION}; "
-            "rebuild candidates so length_delta does not depend on ground truth"
+            "rebuild candidates for the interpolation selector"
         )
     cols = feature_columns(records, args.features)
     methods = [part.strip() for part in args.methods.split(",") if part.strip()]
+    if methods != [SELECTOR_METHOD]:
+        raise SystemExit(f"--methods must be {SELECTOR_METHOD}")
+    if args.lambda_steps < 2 or args.lambda_max <= args.lambda_min or args.lambda_min < 0:
+        raise SystemExit("lambda grid requires 0 <= --lambda-min < --lambda-max and --lambda-steps >= 2")
+    lm_weights = np.linspace(args.lambda_min, args.lambda_max, args.lambda_steps, dtype=np.float64)
     folds = sorted({int(rec["fold"]) for rec in records})
-    all_results = []
-    for method in methods:
-        log(f"nested scorer eval: {method}")
-        fold_predictions = []
-        fold_scores = []
-        for fold_id in folds:
-            train_records = [rec for rec in records if int(rec["fold"]) != fold_id]
-            eval_records = [rec for rec in records if int(rec["fold"]) == fold_id]
-            X_train = matrix(train_records, cols)
-            X_eval = matrix(eval_records, cols)
-            try:
-                model = fit_score_model(method, train_records, X_train, cols, args)
-                scores = predict_scores(model, method, X_eval)
-            except Exception as exc:
-                print(f"  fold {fold_id}: {method} failed: {exc}", flush=True)
-                fold_scores.append({"fold": fold_id, "failed": str(exc)})
-                continue
-            picked = pick_by_scores(eval_records, scores)
-            fold_predictions.extend(picked["predictions"])
-            fold_scores.append({k: v for k, v in picked.items() if k != "predictions"} | {"fold": fold_id})
-            print(f"  fold {fold_id}: CER={picked['cer']:.6f} errors={picked['errors']}/{picked['chars']} oracle={picked['oracle_cer']:.6f}", flush=True)
-        total_err = sum(int(row["err"]) for row in fold_predictions)
-        total_chars = sum(int(row["chars"]) for row in fold_predictions)
-        total_oracle = sum(int(row["oracle_err"]) for row in fold_predictions)
-        rec = {
-            "method": method,
-            "cer": total_err / total_chars if total_chars else None,
-            "errors": total_err,
+    if len(folds) < 2:
+        raise SystemExit("nested OOF tuning requires at least two folds")
+
+    log(f"nested selector eval: {SELECTOR_METHOD}")
+    fold_records = {fold: [rec for rec in records if int(rec["fold"]) == fold] for fold in folds}
+    fold_curves = {fold: interpolation_grid_metrics(fold_records[fold], lm_weights) for fold in folds}
+    fold_predictions: list[dict[str, Any]] = []
+    fold_scores = []
+    for fold_id in folds:
+        train_errors = sum(
+            (fold_curves[fold]["errors"] for fold in folds if fold != fold_id),
+            start=np.zeros(len(lm_weights), dtype=np.int64),
+        )
+        train_chars = sum(int(fold_curves[fold]["chars"]) for fold in folds if fold != fold_id)
+        grid_idx = best_grid_index(train_errors)
+        lm_weight = float(lm_weights[grid_idx])
+        eval_records = fold_records[fold_id]
+        picked = pick_by_scores(eval_records, interpolation_scores(eval_records, lm_weight))
+        fold_predictions.extend(picked["predictions"])
+        fold_scores.append({
+            **{k: v for k, v in picked.items() if k != "predictions"},
+            "fold": fold_id,
+            "lm_weight": lm_weight,
+            "train_errors": int(train_errors[grid_idx]),
+            "train_chars": train_chars,
+            "train_cer": float(train_errors[grid_idx] / train_chars) if train_chars else None,
+        })
+        print(
+            f"  fold {fold_id}: lambda={lm_weight:.4f} CER={picked['cer']:.6f} "
+            f"errors={picked['errors']}/{picked['chars']} oracle={picked['oracle_cer']:.6f}",
+            flush=True,
+        )
+
+    total_err = sum(int(row["err"]) for row in fold_predictions)
+    total_chars = sum(int(row["chars"]) for row in fold_predictions)
+    total_oracle = sum(int(row["oracle_err"]) for row in fold_predictions)
+    result = {
+        "method": SELECTOR_METHOD,
+        "cer": total_err / total_chars if total_chars else None,
+        "errors": total_err,
+        "chars": total_chars,
+        "rows": len(fold_predictions),
+        "oracle_cer": total_oracle / total_chars if total_chars else None,
+        "oracle_errors": total_oracle,
+        "folds": fold_scores,
+    }
+    print(
+        f"TOTAL {SELECTOR_METHOD}: CER={result['cer']:.6f} "
+        f"errors={total_err}/{total_chars} oracle={result['oracle_cer']:.6f}",
+        flush=True,
+    )
+
+    all_errors = sum(
+        (fold_curves[fold]["errors"] for fold in folds),
+        start=np.zeros(len(lm_weights), dtype=np.int64),
+    )
+    final_idx = best_grid_index(all_errors)
+    final_weight = float(lm_weights[final_idx])
+    final_selector = {
+        "method": SELECTOR_METHOD,
+        "features": cols,
+        "formula": "visual_sum + lm_weight * ppm_sum",
+        "lm_weight": final_weight,
+        "objective": "OOF corpus CER",
+        "tie_break": "lowest lm_weight",
+    }
+    tuning_curve = [
+        {
+            "lm_weight": float(weight),
+            "errors": int(errors),
             "chars": total_chars,
-            "rows": len(fold_predictions),
-            "oracle_cer": total_oracle / total_chars if total_chars else None,
-            "oracle_errors": total_oracle,
-            "folds": fold_scores,
+            "cer": float(errors / total_chars) if total_chars else None,
         }
-        all_results.append(rec)
-        print(f"TOTAL {method}: CER={rec['cer']:.6f} errors={total_err}/{total_chars} oracle={rec['oracle_cer']:.6f}", flush=True)
-    all_results.sort(key=lambda r: (math.inf if r["cer"] is None else r["cer"], r["method"]))
-    final_fit = None
-    if all_results:
-        best_method = str(all_results[0]["method"])
-        try:
-            final_model = fit_score_model(best_method, records, matrix(records, cols), cols, args)
-            final_fit = serializable_model(final_model, best_method, cols)
-        except Exception as exc:
-            final_fit = {"method": best_method, "failed": str(exc)}
+        for weight, errors in zip(lm_weights, all_errors)
+    ]
     out = {
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "candidate_manifest": manifest,
         "candidates": str(args.candidates),
         "features": cols,
-        "target": args.target,
         "methods": methods,
-        "scores": all_results,
-        "best": all_results[0] if all_results else None,
-        "final_fit": final_fit,
+        "objective": "OOF corpus CER",
+        "lambda_grid": {
+            "min": float(args.lambda_min),
+            "max": float(args.lambda_max),
+            "steps": int(args.lambda_steps),
+        },
+        "tuning_curve": tuning_curve,
+        "scores": [result],
+        "best": result,
+        "final_selector": final_selector,
     }
     atomic_write_json(
         args.out,
@@ -659,11 +691,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     build = sub.add_parser("build-candidates", help="build OOF row-candidate feature table from fold logits")
     build.add_argument("--folds-ids", default="0,1,2,3,4")
-    build.add_argument("--orders", default="6,10,12")
+    build.add_argument("--orders", default="12")
     build.add_argument("--fold-lm-template", default="",
                        help="optional LM path template with {order} and {fold}; default uses the OOF ranker cache")
     build.add_argument("--tag-prefix", default="oof")
-    build.add_argument("--proposal-weights", default="0,0.25,0.5,0.75,1.0")
+    build.add_argument("--proposal-weights", default="1.0")
     build.add_argument("--beam", type=int, default=256)
     build.add_argument("--char-topk", type=int, default=8)
     build.add_argument("--device", default="auto")
@@ -688,26 +720,27 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument("--out", type=Path, default=OOF_DIR / "candidates.json")
     merge.set_defaults(func=command_merge_candidates)
 
-    fit = sub.add_parser("fit-rankers", help="nested fold-heldout evaluation of the ridge row-candidate scorer")
+    fit = sub.add_parser("fit-rankers", help="nested OOF tuning of visual/PPM interpolation")
     fit.add_argument("--candidates", type=Path, default=OOF_DIR / "candidates.json")
     fit.add_argument("--out", type=Path, default=OOF_DIR / "ranker_scores.json")
-    fit.add_argument("--features", default="",
-                     help="comma-separated feature list; default uses visual + train-only n-gram features")
-    fit.add_argument("--target", choices=("target_neg_edit", "target_neg_cer"), default="target_neg_edit")
-    fit.add_argument("--methods", default="ridge")
-    fit.add_argument("--alpha", type=float, default=1.0)
-    fit.add_argument("--seed", type=int, default=42)
+    fit.add_argument("--features", default=",".join(SELECTOR_FEATURES),
+                     help="must be visual_sum,ppm_sum")
+    fit.add_argument("--methods", default=SELECTOR_METHOD)
+    fit.add_argument("--lambda-min", type=float, default=0.0)
+    fit.add_argument("--lambda-max", type=float, default=4.0)
+    fit.add_argument("--lambda-steps", type=int, default=401,
+                     help="inclusive linear grid; equal-CER ties choose the lowest weight")
     fit.add_argument("--allow-legacy-candidates", action="store_true",
-                     help="allow candidate tables without the current length_delta feature marker")
+                     help="allow candidate tables without the current feature-version marker")
     fit.set_defaults(func=command_fit_rankers)
 
     dec = sub.add_parser("decode", help="apply the selected charpost ranker to cached final logits")
     dec.add_argument("--tag", default="all_train")
     dec.add_argument("--split", default="test")
     dec.add_argument("--ranker", type=Path, default=OOF_DIR / "clean_ranker_scores.json")
-    dec.add_argument("--orders", default="6,10,12")
+    dec.add_argument("--orders", default="12")
     dec.add_argument("--lm-template", default=str(CHARPOST_DIR / "train_lm_order{order}_train" / "lm.json"))
-    dec.add_argument("--proposal-weights", default="0,0.25,0.5,0.75,1.0")
+    dec.add_argument("--proposal-weights", default="1.0")
     dec.add_argument("--beam", type=int, default=256)
     dec.add_argument("--char-topk", type=int, default=8)
     dec.add_argument("--device", default="auto")

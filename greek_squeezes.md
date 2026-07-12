@@ -1,6 +1,7 @@
 ---
 jupyter:
   jupytext:
+    formats: ipynb,md
     text_representation:
       extension: .md
       format_name: markdown
@@ -22,10 +23,10 @@ the same runtime modules used by the Modal runner.
 The deployed system has two stages:
 
 - `SqueezeTrOCR` dual-light TrOCR line recognizers. The all-train checkpoint is used for final
-  deployment; five fold-excluded checkpoints provide clean OOF evidence for ranker fitting.
+  deployment; five fold-excluded checkpoints provide clean OOF evidence for selector tuning.
 - A character-posterior (`charpost`) correction layer. It trains tile1 dual-light character
   classifiers, caches per-position logits, proposes row candidates from visual lattices plus
-  character LMs, and fits a ridge row ranker.
+  character LMs, and tunes one visual--PPM interpolation weight.
 
 Dual-light means the two raking-light scans are treated as one observation. Each paired crop is
 phase-registered and packed into TrOCR's normal RGB input:
@@ -77,7 +78,7 @@ real token pasted into it.
 # Modal: prepared volume at /mnt/greek-squeezes-data, repo at $MODAL_REPO_ROOT.
 # Local: repo root is the cwd, artifacts in ./data.
 FORCE_REDOWNLOAD = False
-HF_BUCKET_URI = 'hf://buckets/papadimas/greek_squeezes'
+HF_BUCKET_URI = 'hf://buckets/papadimas/greek_squeezes/ppm_unified'
 # For local runs: set your token here instead of exporting HF_TOKEN (Modal
 # injects HF_TOKEN via the huggingface-token secret). Don't commit a real one.
 HF_TOKEN = ''
@@ -310,7 +311,7 @@ LINE_ALL_TRAIN = LINE_DIR / 'all_train'
 LINE_OOF_FOLD = {fold: LINE_DIR / f'oof_fold{fold}' for fold in FOLDS}
 CHARPOST_ALL_TRAIN_TAG = 'all_train'
 CHARPOST_OOF_PREFIX = 'oof'
-CHARPOST_ORDERS = (6, 10, 12)
+CHARPOST_ORDERS = (12,)
 CHARPOST_ORDER_ARG = ','.join(str(order) for order in CHARPOST_ORDERS)
 IMAGE_CACHE_DIR = CHARPOST_DIR / 'image_cache'
 RANKER_DIR = CHARPOST_DIR / 'oof_ranker'
@@ -319,8 +320,8 @@ RANKER_JSON = RANKER_DIR / 'ranker_scores.json'
 
 RUN_TRAINING_IF_MISSING = True
 
-RANKER_METHODS = 'ridge'
-CHARPOST_RANKER_FEATURES = 'visual_sum,mean_char_logprob,length,length_delta,lm6_sum,lm10_sum,lm12_sum'
+RANKER_METHODS = 'visual_ppm_interpolation'
+CHARPOST_RANKER_FEATURES = 'visual_sum,ppm_sum'
 
 os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
 os.environ.setdefault('TORCH_SHARE_STRATEGY', 'file_system')
@@ -422,9 +423,12 @@ print('runtime modules:', ', '.join(['duallight', 'prep_cache', 'line_folds', 'r
 
 ## 2. Pipeline Configuration
 
-The active charpost recipe uses orders 6, 10, and 12 character LMs, a ridge scorer, and the
-`lattice_length_delta_v2` feature schema. Candidate generation uses the defaults enforced by
-`ArtifactChecks`: proposal weights `0,0.25,0.5,0.75,1.0`, beam 256, and char-top-k 8.
+The active charpost recipe uses a single order-12 character count model scored by adaptive-order
+PPM-C -- the one language mechanism, driving both candidate proposals and the selector's LM score --
+the OOF-tuned interpolation `visual_sum + lambda * ppm_sum`, and the `ppm_interpolation_v2`
+feature schema. Candidate generation uses the defaults
+enforced by `ArtifactChecks`: one purely visual beam plus one PPM-C-weighted beam (proposal
+weight `1.0`), beam 256, and char-top-k 8.
 
 ```python
 from artifact_checks import ArtifactChecks, PipelineConfig
@@ -483,17 +487,18 @@ PIPELINE.ensure_line_models()
 
 This stage builds or validates the dual-light image cache, five fold-excluded charpost
 classifiers, fold logits, and fold-excluded character LMs. These are the only artifacts used
-to fit the row ranker, so validation/test rows are not used for ranker selection.
+to tune the row selector, so validation/test rows are not used for selector selection.
 
 ```python
 PIPELINE.ensure_oof_artifacts()
 ```
 
-## 5. Candidate Table and Ridge Ranker
+## 5. Candidate Table and One-Parameter Selector
 
-The ranker stage converts held-out fold lattices into row candidates, computes visual and LM
-features, and fits the final ridge scorer. The selected feature set is:
-`visual_sum, mean_char_logprob, length, length_delta, lm6_sum, lm10_sum, lm12_sum`.
+The selector stage converts held-out fold lattices into row candidates and tunes the score
+`visual_sum + lambda * ppm_sum` directly on corpus CER. Nested fold-heldout tuning selects
+`lambda=0.84` in every outer fold; the final all-OOF search selects the same value. The complete
+feature set is `visual_sum, ppm_sum`.
 
 ```python
 PIPELINE.ensure_ranker()
@@ -512,7 +517,11 @@ PIPELINE.ensure_decodes()
 
 ## 7. Summary
 
-The summary prints artifact readiness, OOF ranker quality, and any available validation/test decode scores. After freezing the methods, the `papadimas/trogs-26-test-images` run reported 50 squeezes, 100 images, 605 scored rows, 7,919 characters, 651 errors, and CER 0.0822073494.
+The summary prints artifact readiness, nested OOF selector quality, and any available
+validation/test decode scores. The interpolation selector reaches OOF CER 0.049770
+(2,672/53,687), validation CER 0.022929 (93/4,056), and test CER 0.022207 (100/4,503).
+The rescored external `papadimas/trogs-26-test-images` production set scores 664/7,919
+(CER 0.083849); official v2 `all_cer` is 0.0786.
 
 ```python
 PIPELINE.summarize()
@@ -524,7 +533,7 @@ This section makes the charpost mechanism inspectable on real cached artifacts a
 every figure used by `report/report.tex` into `report/figs/`. The figure builders live in
 `squeeze_runtime/report_figs.py`.
 
-`find_example_row` scans the frozen all-train test decode for a real row where the ranker
+`find_example_row` scans the frozen all-train test decode for a real row where the selector
 overturns the visual-only argmax and lands on the ground truth (falling back to any
 disagreement, then the first row). The same returned row is then reused for the printed
 step-by-step narrative and for both lattice figures, so the report's prose and its figures
@@ -547,10 +556,10 @@ its inputs and is skipped (with a message) when the corresponding `data/` artifa
 synced or built yet:
 
 - `charpost_lattice_example.png` — the same row as above, but as a full-alphabet lattice
-  heatmap with the truth / visual-only / ranker-selected paths and the top-scored candidates;
-- `charpost_cer_ladder.png` — OOF CER of the visual-only argmax vs the fitted ridge ranker
-  vs the lattice oracle, from the frozen candidate table;
-- `charpost_ranker_weights.png` — standardized ridge coefficients of the production ranker;
+  heatmap with the truth / visual-only / selector-selected paths and the top-scored candidates;
+- `charpost_cer_ladder.png` — OOF CER of the visual-only argmax vs the tuned interpolation
+  vs the ground-truth-selected candidate-pool oracle, from the frozen candidate table;
+- `charpost_selector_tuning.png` — the all-OOF CER curve used to choose `lambda=0.84`;
 - `charpost_confusion.png` — aggregate OOF tile1 classifier confusion over the 27-symbol
   charpost alphabet.
 
@@ -561,7 +570,7 @@ if example is not None:
     if _path:
         _display(_Image(str(_path)))
 
-for _fig in (RF.fig_cer_ladder, RF.fig_ranker_weights, RF.fig_confusion):
+for _fig in (RF.fig_cer_ladder, RF.fig_selector_tuning, RF.fig_confusion):
     _path = RF.maybe(_fig)
     if _path:
         _display(_Image(str(_path)))

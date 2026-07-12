@@ -209,7 +209,7 @@ def load(ckpt=None, tile=8, verbose=True, load_model=True, train_context=False):
     proc_path = _processor_path_for_ckpt(ckpt)
     if proc_path:
         from transformers import TrOCRProcessor
-        g['processor'] = TrOCRProcessor.from_pretrained(proc_path)
+        g['processor'] = TrOCRProcessor.from_pretrained(proc_path, use_fast=False)
         g['processor_path'] = proc_path
     elif run_config.get('char_vocab'):
         g['processor'].tokenizer = _build_char_tokenizer(g['ALPHABET'])
